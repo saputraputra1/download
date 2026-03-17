@@ -1,824 +1,1471 @@
-from flask import Flask, request, jsonify, Response, stream_with_context
-import yt_dlp
-import requests
-import re
 import os
-import tempfile
+import re
+import uuid
+import zipfile
+import threading
+from pathlib import Path
+from flask import Flask, request, jsonify, send_file, render_template_string
+
+import yt_dlp
+try:
+    import requests as _req
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 
 app = Flask(__name__)
+# Vercel: filesystem is read-only except /tmp
+DOWNLOAD_DIR = Path("/tmp/downloads")
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# ─────────────────────────────────────────
-#  PLATFORM DETECTION
-# ─────────────────────────────────────────
-def detect_platform(url: str) -> str:
-    patterns = {
-        "youtube":   r"(youtube\.com|youtu\.be)",
-        "tiktok":    r"(tiktok\.com|vm\.tiktok\.com)",
-        "instagram": r"instagram\.com",
-        "facebook":  r"(facebook\.com|fb\.watch|fb\.com)",
-        "twitter":   r"(twitter\.com|x\.com|t\.co)",
-    }
-    for platform, pattern in patterns.items():
-        if re.search(pattern, url, re.IGNORECASE):
-            return platform
-    return "unknown"
+progress_store = {}   # single-download progress
+batch_store    = {}   # batch job store  {batch_id: {...}}
 
-# ─────────────────────────────────────────
-#  USER-AGENTS
-# ─────────────────────────────────────────
-UA_CHROME = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-UA_ANDROID_TT = (
-    "com.zhiliaoapp.musically/2022600030 "
-    "(Linux; U; Android 13; en_US; Pixel 7; "
-    "Build/TQ3A.230901.001; Cronet/58.0.2991.0)"
-)
-UA_IPHONE = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-    "Version/17.0 Mobile/15E148 Safari/604.1"
-)
+# ─────────────────────────────────────────────────────────────
+#  PLATFORM REGISTRY
+# ─────────────────────────────────────────────────────────────
+PLATFORMS = {
+    "youtube.com":      ("YouTube",     "▶",  "#ff0000"),
+    "youtu.be":         ("YouTube",     "▶",  "#ff0000"),
+    "tiktok.com":       ("TikTok",      "♪",  "#69c9d0"),
+    "instagram.com":    ("Instagram",   "◈",  "#e1306c"),
+    "facebook.com":     ("Facebook",    "f",  "#1877f2"),
+    "fb.watch":         ("Facebook",    "f",  "#1877f2"),
+    "twitter.com":      ("Twitter/X",   "𝕏",  "#1da1f2"),
+    "x.com":            ("Twitter/X",   "𝕏",  "#1da1f2"),
+    "reddit.com":       ("Reddit",      "⬆",  "#ff4500"),
+    "vimeo.com":        ("Vimeo",       "V",  "#1ab7ea"),
+    "dailymotion.com":  ("Dailymotion", "D",  "#0066dc"),
+    "twitch.tv":        ("Twitch",      "⬛", "#9146ff"),
+    "pinterest.com":    ("Pinterest",   "P",  "#e60023"),
+    "linkedin.com":     ("LinkedIn",    "in", "#0a66c2"),
+    "soundcloud.com":   ("SoundCloud",  "☁",  "#ff5500"),
+    "rumble.com":       ("Rumble",      "R",  "#85c742"),
+    "bilibili.com":     ("Bilibili",    "B",  "#00a1d6"),
+    "ted.com":          ("TED",         "T",  "#e62b1e"),
+    "loom.com":         ("Loom",        "L",  "#625df5"),
+    "ucshare.com":      ("UCShare",     "U",  "#f5a623"),
+    "uc.cn":            ("UCShare",     "U",  "#f5a623"),
+}
 
-# ─────────────────────────────────────────
-#  PER-PLATFORM YT-DLP OPTIONS
-# ─────────────────────────────────────────
-def build_opts(platform: str, skip_download: bool = True) -> dict:
-    opts = {
-        "quiet":              True,
-        "no_warnings":        True,
-        "skip_download":      skip_download,
-        "socket_timeout":     30,
-        "nocheckcertificate": True,
-        "geo_bypass":         True,
-        "age_limit":          99,
-        "extractor_args":     {},
+def detect_platform(url: str):
+    u = url.lower()
+    for kw, (name, emoji, color) in PLATFORMS.items():
+        if kw in u:
+            return name, emoji, color
+    return None
+
+def get_format_selector(fmt: str) -> str:
+    return {
+        "360p":  "bestvideo[height<=360]+bestaudio/best[height<=360]/best",
+        "720p":  "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+        "mp3":   "bestaudio/best",
+    }.get(fmt, "bestvideo[height<=720]+bestaudio/best")
+
+def base_ydl_opts(hook=None) -> dict:
+    o = {
+        "quiet": True, "no_warnings": True, "socket_timeout": 60,
         "http_headers": {
-            "User-Agent":      UA_CHROME,
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
         },
     }
+    if hook:
+        o["progress_hooks"] = [hook]
+    return o
 
-    if platform == "youtube":
-        # Android client bypasses most sign-in prompts and age gates
-        opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["android", "web"],
-                "player_skip":   ["webpage", "config"],
-            }
-        }
+def pick_thumbnail(info: dict) -> str:
+    t = info.get("thumbnail") or ""
+    if not t and info.get("thumbnails"):
+        thumbs = [x for x in info["thumbnails"] if x.get("url")]
+        if thumbs:
+            thumbs.sort(key=lambda x: (x.get("width") or 0)*(x.get("height") or 0), reverse=True)
+            t = thumbs[0]["url"]
+    return t
 
-    elif platform == "tiktok":
-        opts["http_headers"]["User-Agent"] = UA_ANDROID_TT
-        opts["extractor_args"] = {
-            "tiktok": {
-                "api_hostname": "api22-normal-c-useast2a.tiktokv.com",
-                "app_version":  "26.1.3",
-            }
-        }
+# ─────────────────────────────────────────────────────────────
+#  UCSHARE CUSTOM EXTRACTOR
+#  yt-dlp belum support UCShare secara native, jadi kita scrape
+#  langsung dari halaman HTML-nya.
+# ─────────────────────────────────────────────────────────────
+def is_ucshare(url: str) -> bool:
+    u = url.lower()
+    return "ucshare.com" in u or "uc.cn" in u or "share.uc.cn" in u
 
-    elif platform == "instagram":
-        opts["http_headers"] = {
-            "User-Agent":      UA_IPHONE,
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer":         "https://www.instagram.com/",
-        }
-        opts["extractor_args"] = {
-            "instagram": {"include_feed_data": ["0"]}
-        }
+def ucshare_extract_info(url: str) -> dict:
+    """
+    Scrape info & video URL dari halaman UCShare.
+    Return dict mirip yt-dlp info_dict, atau raise Exception jika gagal.
+    """
+    if not HAS_REQUESTS:
+        raise Exception("Library 'requests' tidak terinstall. Jalankan: pip install requests")
 
-    elif platform == "facebook":
-        opts["http_headers"] = {
-            "User-Agent":      UA_CHROME,
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer":         "https://www.facebook.com/",
-            "sec-fetch-site":  "same-origin",
-        }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 10; SM-G975F) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.6099.144 Mobile Safari/537.36"
+        ),
+        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
+        "Referer": "https://www.ucshare.com/",
+    }
 
-    elif platform == "twitter":
-        opts["http_headers"] = {
-            "User-Agent":      UA_CHROME,
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer":         "https://twitter.com/",
-        }
+    resp = _req.get(url, headers=headers, timeout=20, allow_redirects=True)
+    resp.raise_for_status()
+    html = resp.text
 
-    return opts
+    # ── Cari video URL ──────────────────────────────
+    video_url = None
 
-# ─────────────────────────────────────────
-#  HELPERS
-# ─────────────────────────────────────────
-def format_duration(seconds) -> str:
-    if not seconds:
-        return "N/A"
-    try:
-        s = int(seconds)
-        h, rem = divmod(s, 3600)
-        m, sec = divmod(rem, 60)
-        return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
-    except Exception:
-        return "N/A"
-
-
-def format_filesize(size) -> str:
-    if not size:
-        return "N/A"
-    try:
-        for unit in ["B", "KB", "MB", "GB"]:
-            if size < 1024:
-                return f"{size:.1f} {unit}"
-            size /= 1024
-        return f"{size:.1f} TB"
-    except Exception:
-        return "N/A"
-
-
-def parse_formats(info: dict) -> list:
-    formats = info.get("formats", [])
-    result, seen = [], set()
-
-    for f in formats:
-        vcodec = f.get("vcodec", "none")
-        if vcodec in (None, "none"):
-            continue
-        height = f.get("height") or 0
-        fid    = f.get("format_id", "")
-        size   = f.get("filesize") or f.get("filesize_approx")
-        acodec = f.get("acodec", "none")
-        label  = f"{height}p" if height else fid
-        if label in seen:
-            continue
-        seen.add(label)
-        result.append({
-            "format_id": fid,
-            "label":     label,
-            "ext":       f.get("ext", "mp4"),
-            "height":    height,
-            "filesize":  format_filesize(size),
-            "has_audio": acodec not in (None, "none"),
-        })
-
-    result.sort(key=lambda x: x["height"], reverse=True)
-    if not result:
-        return [{"format_id": "best", "label": "Best Quality",
-                 "ext": "mp4", "height": 0, "filesize": "N/A", "has_audio": True}]
-    return result[:8]
-
-
-def classify_error(raw: str) -> str:
-    """Convert raw yt-dlp error to friendly Bahasa Indonesia message."""
-    m = raw.lower()
-
-    if any(k in m for k in ["sign in", "login", "log in", "private",
-                              "not available", "members only",
-                              "this video is private", "who can watch"]):
-        return (
-            "Video bersifat privat atau memerlukan login. "
-            "Pastikan video bisa dibuka tanpa akun, lalu coba lagi."
-        )
-    if any(k in m for k in ["not available in your country", "geo", "blocked in"]):
-        return "Video dibatasi secara geografis dan tidak dapat diakses dari server ini."
-    if any(k in m for k in ["age", "18+", "adult content", "age-restricted"]):
-        return "Video memiliki batasan usia (18+) dan memerlukan akun terverifikasi."
-    if any(k in m for k in ["copyright", "removed", "deleted", "terminated",
-                              "no longer available", "unavailable"]):
-        return "Video telah dihapus, dikenai copyright, atau tidak tersedia lagi."
-    if "unsupported url" in m:
-        return (
-            "URL tidak dikenali. Pastikan link mengarah langsung ke video, "
-            "bukan ke profil atau beranda platform."
-        )
-    if any(k in m for k in ["429", "too many requests", "rate limit"]):
-        return "Terlalu banyak permintaan ke platform. Tunggu 1–2 menit lalu coba lagi."
-    if "404" in m:
-        return "Video tidak ditemukan (404). Mungkin sudah dihapus atau link salah."
-    if "403" in m:
-        return "Akses ditolak platform (403). Video mungkin memerlukan autentikasi."
-
-    return f"Gagal mengambil video: {raw[:220].strip()}"
-
-
-# ─────────────────────────────────────────
-#  ROUTES
-# ─────────────────────────────────────────
-@app.route("/")
-def index():
-    return HTML_PAGE
-
-
-@app.route("/api/info", methods=["POST"])
-def api_info():
-    data     = request.get_json(silent=True) or {}
-    url      = (data.get("url") or "").strip()
-
-    if not url:
-        return jsonify({"error": "URL tidak boleh kosong"}), 400
-
-    platform = detect_platform(url)
-    if platform == "unknown":
-        return jsonify({
-            "error": (
-                "Platform tidak didukung. "
-                "Gunakan link dari YouTube, TikTok, Instagram, Facebook, atau Twitter/X."
-            )
-        }), 400
-
-    try:
-        opts = build_opts(platform, skip_download=True)
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-        if not info:
-            return jsonify({"error": "Tidak dapat mengambil informasi video"}), 400
-
-        thumbnails = info.get("thumbnails") or []
-        thumb = ""
-        if thumbnails:
-            best  = max(thumbnails, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
-            thumb = best.get("url", "")
-        if not thumb:
-            thumb = info.get("thumbnail", "")
-
-        return jsonify({
-            "title":        info.get("title", "Video"),
-            "duration":     format_duration(info.get("duration")),
-            "thumbnail":    thumb,
-            "uploader":     info.get("uploader") or info.get("channel") or "",
-            "view_count":   info.get("view_count"),
-            "platform":     platform,
-            "formats":      parse_formats(info),
-            "original_url": url,
-        })
-
-    except yt_dlp.utils.DownloadError as e:
-        return jsonify({"error": classify_error(str(e))}), 400
-    except Exception as e:
-        return jsonify({"error": f"Error tidak terduga: {str(e)[:200]}"}), 500
-
-
-@app.route("/download", methods=["POST"])
-def download():
-    data      = request.get_json(silent=True) or {}
-    url       = (data.get("url") or "").strip()
-    format_id = (data.get("format_id") or "best").strip()
-    platform  = detect_platform(url)
-
-    if not url:
-        return jsonify({"error": "URL tidak boleh kosong"}), 400
-
-    if format_id and format_id != "best":
-        fmt_str = f"{format_id}+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
-    else:
-        fmt_str = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
-
-    tmp_dir = tempfile.mkdtemp()
-
-    try:
-        opts = build_opts(platform, skip_download=False)
-        opts.update({
-            "format":              fmt_str,
-            "outtmpl":             os.path.join(tmp_dir, "%(title).80s.%(ext)s"),
-            "socket_timeout":      60,
-            "merge_output_format": "mp4",
-            "postprocessors": [{
-                "key":            "FFmpegVideoConvertor",
-                "preferedformat": "mp4",
-            }],
-        })
-
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info     = ydl.extract_info(url, download=True)
-            prepared = ydl.prepare_filename(info)
-
-        # Find output file
-        actual_file = None
-        for fname in os.listdir(tmp_dir):
-            fpath = os.path.join(tmp_dir, fname)
-            if os.path.isfile(fpath):
-                actual_file = fpath
+    # Pola 1: JSON embed {"url":"https://...mp4"}
+    for pat in [
+        r'"url"\s*:\s*"(https?://[^"]+\.mp4[^"]*)"',
+        r'"videoUrl"\s*:\s*"(https?://[^"]+)"',
+        r'"video_url"\s*:\s*"(https?://[^"]+)"',
+        r'<video[^>]+src=["\']([^"\']+)["\']',
+        r'source\s+src=["\']([^"\']+mp4[^"\']*)["\']',
+        r'"playUrl"\s*:\s*"(https?://[^"]+)"',
+        r'"play_url"\s*:\s*"(https?://[^"]+)"',
+        r'data-src=["\']([^"\']+mp4[^"\']*)["\']',
+    ]:
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).replace('\\/', '/').replace('\\u0026', '&')
+            if candidate.startswith("http"):
+                video_url = candidate
                 break
 
-        if not actual_file:
-            base = os.path.splitext(prepared)[0]
-            for ext in (".mp4", ".mkv", ".webm", ".mov"):
-                if os.path.exists(base + ext):
-                    actual_file = base + ext
-                    break
-
-        if not actual_file or not os.path.exists(actual_file):
-            return jsonify({"error": "File hasil download tidak ditemukan di server"}), 500
-
-        safe_title = re.sub(r'[^\w\s\-]', '', info.get("title", "video"))[:80].strip() or "video"
-        dl_name    = f"{safe_title}.mp4"
-        filesize   = os.path.getsize(actual_file)
-
-        def generate():
-            with open(actual_file, "rb") as fh:
-                while chunk := fh.read(512 * 1024):
-                    yield chunk
-            try:
-                os.remove(actual_file)
-                os.rmdir(tmp_dir)
-            except Exception:
-                pass
-
-        return Response(
-            stream_with_context(generate()),
-            mimetype="video/mp4",
-            headers={
-                "Content-Disposition": f'attachment; filename="{dl_name}"',
-                "Content-Length":      str(filesize),
-                "X-Video-Title":       safe_title,
-            },
+    if not video_url:
+        raise Exception(
+            "Tidak dapat menemukan URL video di halaman UCShare. "
+            "Kemungkinan konten private, sudah dihapus, atau format halaman berubah."
         )
 
-    except yt_dlp.utils.DownloadError as e:
-        return jsonify({"error": classify_error(str(e))}), 400
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)[:300]}"}), 500
+    # ── Cari judul ──────────────────────────────────
+    title = "UCShare Video"
+    for pat in [
+        r'<title>([^<]+)</title>',
+        r'"title"\s*:\s*"([^"]+)"',
+        r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"',
+        r'<h1[^>]*>([^<]+)</h1>',
+    ]:
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            t = m.group(1).strip()
+            if t and t.lower() not in ("ucshare","share","video"):
+                title = t
+                break
+
+    # ── Cari thumbnail ───────────────────────────────
+    thumbnail = ""
+    for pat in [
+        r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"',
+        r'"thumbnail"\s*:\s*"([^"]+)"',
+        r'"cover"\s*:\s*"([^"]+)"',
+        r'"poster"\s*:\s*"([^"]+)"',
+    ]:
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            thumbnail = m.group(1).replace('\\/', '/').replace('\\u0026', '&')
+            break
+
+    # ── Cari uploader ────────────────────────────────
+    uploader = "UCShare User"
+    for pat in [
+        r'"author"\s*:\s*"([^"]+)"',
+        r'"nickname"\s*:\s*"([^"]+)"',
+        r'"username"\s*:\s*"([^"]+)"',
+        r'"name"\s*:\s*"([^"]+)"',
+    ]:
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            u = m.group(1).strip()
+            if u:
+                uploader = u
+                break
+
+    return {
+        "title":     title,
+        "uploader":  uploader,
+        "thumbnail": thumbnail,
+        "duration":  None,
+        "video_url": video_url,
+        "ext":       "mp4",
+    }
 
 
-# ─────────────────────────────────────────
-#  FRONTEND
-# ─────────────────────────────────────────
-HTML_PAGE = r"""<!DOCTYPE html>
+def ucshare_download(url: str, out_path: str, hook_fn=None) -> dict:
+    """
+    Download video UCShare langsung via requests streaming.
+    Kembalikan info dict.
+    """
+    info = ucshare_extract_info(url)
+    video_url = info["video_url"]
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Referer": url,
+    }
+
+    out_file = Path(out_path)
+    with _req.get(video_url, headers=headers, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        downloaded = 0
+        with open(out_file, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024*64):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if hook_fn and total > 0:
+                        pct = int(downloaded / total * 100)
+                        hook_fn({"status":"downloading",
+                                 "downloaded_bytes": downloaded,
+                                 "total_bytes": total,
+                                 "speed": None})
+
+    if hook_fn:
+        hook_fn({"status":"finished"})
+
+    return info
+
+
+def safe_fname(info: dict, fallback="video") -> str:
+    t = re.sub(r'[^\w\s\-.]', '', info.get("title", fallback))
+    return t.strip()[:60] or fallback
+
+# ─────────────────────────────────────────────────────────────
+#  HTML TEMPLATE
+# ─────────────────────────────────────────────────────────────
+HTML = r"""<!DOCTYPE html>
 <html lang="id">
 <head>
 <meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>VortexDL — Video Downloader</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>VortexDL — Universal Downloader</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500&display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet"/>
 <style>
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg0:#05060a;--bg1:#0c0d14;--bg2:#121420;--bg3:#1a1d2e;
-  --glass:rgba(255,255,255,0.04);--glass-b:rgba(255,255,255,0.08);
-  --accent:#7c6aff;--accent2:#ff6ac1;--accent3:#6affdb;
-  --text:#eeeef4;--dim:#888ca8;--muted:#444660;
-  --ok:#22d87a;--err:#ff4f6a;
-  --r:16px;--rs:10px;--tr:.25s cubic-bezier(.4,0,.2,1);
+  --bg:#080b10;--surface:#0e1319;--card:#141920;--border:#1e2730;
+  --accent:#ff2d44;--accent2:#ff6b35;--accent-glow:#ff2d4420;
+  --text:#e8edf3;--muted:#5a6a7a;--dim:#2a3540;
+  --success:#00e5a0;--warn:#ffb830;--error:#ff6b7a;
+  --radius:14px;--font:'Syne',sans-serif;--mono:'DM Mono',monospace;
 }
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html{scroll-behavior:smooth}
-body{font-family:'DM Sans',sans-serif;background:var(--bg0);color:var(--text);min-height:100vh;overflow-x:hidden}
-body::before{content:'';position:fixed;inset:0;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");pointer-events:none;z-index:0}
-.blob{position:fixed;border-radius:50%;filter:blur(110px);pointer-events:none;z-index:0;animation:drift 18s ease-in-out infinite}
-.b1{width:550px;height:550px;background:radial-gradient(circle,rgba(124,106,255,.2),transparent 70%);top:-180px;left:-180px}
-.b2{width:450px;height:450px;background:radial-gradient(circle,rgba(255,106,193,.15),transparent 70%);top:40%;right:-130px;animation-delay:-6s}
-.b3{width:380px;height:380px;background:radial-gradient(circle,rgba(106,255,219,.11),transparent 70%);bottom:-80px;left:28%;animation-delay:-12s}
-@keyframes drift{0%,100%{transform:translate(0,0)}33%{transform:translate(35px,-25px)}66%{transform:translate(-18px,45px)}}
-.wrap{position:relative;z-index:1;max-width:740px;margin:0 auto;padding:36px 20px 80px}
-/* Header */
-header{text-align:center;margin-bottom:44px;padding-top:12px}
-.logo{font-family:'Syne',sans-serif;font-weight:800;font-size:clamp(2rem,6vw,3.2rem);background:linear-gradient(135deg,var(--accent) 0%,var(--accent2) 50%,var(--accent3) 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;letter-spacing:-.03em}
-.logo em{-webkit-text-fill-color:var(--dim);font-style:normal;font-weight:400;font-size:.44em;letter-spacing:.05em}
-.tagline{margin-top:9px;color:var(--dim);font-size:.91rem;font-weight:300}
-.platforms{display:flex;justify-content:center;flex-wrap:wrap;gap:8px;margin-top:16px}
-.badge{display:flex;align-items:center;gap:5px;padding:4px 11px;border-radius:100px;background:var(--glass);border:1px solid var(--glass-b);font-size:.74rem;font-weight:500;color:var(--dim);transition:var(--tr)}
-.badge:hover{border-color:var(--accent);color:var(--accent)}
-.dot{width:6px;height:6px;border-radius:50%}
-/* Card */
-.card{background:var(--glass);border:1px solid var(--glass-b);border-radius:var(--r);padding:26px;backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);transition:border-color var(--tr)}
-.card:focus-within{border-color:rgba(124,106,255,.3)}
-/* Input */
-.input-row{display:flex;gap:10px;flex-wrap:wrap}
-.url-in{flex:1;min-width:190px;background:rgba(255,255,255,.05);border:1.5px solid var(--glass-b);border-radius:var(--rs);color:var(--text);font-family:'DM Sans',sans-serif;font-size:.93rem;padding:12px 15px;outline:none;transition:border-color var(--tr),box-shadow var(--tr)}
-.url-in::placeholder{color:var(--muted)}
-.url-in:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,106,255,.13)}
-/* Buttons */
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;font-family:'DM Sans',sans-serif;font-weight:500;font-size:.88rem;border:none;cursor:pointer;border-radius:var(--rs);padding:12px 18px;transition:var(--tr);white-space:nowrap}
-.primary{background:linear-gradient(135deg,var(--accent),#9e6aff);color:#fff;box-shadow:0 4px 18px rgba(124,106,255,.33)}
-.primary:hover{transform:translateY(-1px);box-shadow:0 6px 26px rgba(124,106,255,.48)}
-.primary:active,.primary:disabled{transform:none;opacity:.55;cursor:not-allowed}
-.success{background:linear-gradient(135deg,var(--ok),#1aad62);color:#fff;width:100%;box-shadow:0 4px 18px rgba(34,216,122,.22);font-size:.95rem;font-weight:600;padding:14px}
-.success:hover{transform:translateY(-1px);box-shadow:0 6px 26px rgba(34,216,122,.38)}
-.success:active,.success:disabled{transform:none;opacity:.55;cursor:not-allowed}
-.ghost{background:var(--glass);border:1px solid var(--glass-b);color:var(--dim);font-size:.78rem;padding:6px 11px}
-.ghost:hover{border-color:var(--accent3);color:var(--accent3)}
+body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;z-index:0;
+  background-image:linear-gradient(rgba(255,45,68,.03)1px,transparent 1px),
+  linear-gradient(90deg,rgba(255,45,68,.03)1px,transparent 1px);
+  background-size:48px 48px;pointer-events:none}
+body::after{content:'';position:fixed;top:-40%;left:50%;transform:translateX(-50%);
+  width:800px;height:600px;
+  background:radial-gradient(ellipse,rgba(255,45,68,.08)0%,transparent 70%);
+  pointer-events:none;z-index:0}
+
+.wrap{position:relative;z-index:1;max-width:800px;margin:0 auto;padding:36px 20px 80px}
+
+/* ── Header ── */
+header{text-align:center;margin-bottom:40px;animation:fadeDown .6s ease both}
+.logo-row{display:inline-flex;align-items:center;gap:12px;margin-bottom:8px}
+.logo-icon{width:46px;height:46px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+  border-radius:12px;display:grid;place-items:center;font-size:20px;
+  box-shadow:0 0 24px var(--accent-glow),0 4px 12px rgba(0,0,0,.4)}
+h1{font-size:clamp(1.8rem,4vw,2.8rem);font-weight:800;letter-spacing:-1.5px;
+  background:linear-gradient(135deg,#fff 30%,var(--accent)100%);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.tagline{color:var(--muted);font-family:var(--mono);font-size:.8rem;letter-spacing:.06em;margin-top:4px}
+
+/* ── Tab switcher ── */
+.tab-bar{display:flex;gap:8px;margin-bottom:24px;background:var(--surface);
+  border:1px solid var(--border);border-radius:12px;padding:4px}
+.tab-btn{flex:1;padding:10px;border:none;background:transparent;color:var(--muted);
+  font-family:var(--font);font-weight:700;font-size:.9rem;border-radius:9px;
+  cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
+.tab-btn.active{background:var(--card);color:var(--text);
+  box-shadow:0 2px 8px rgba(0,0,0,.3);border:1px solid var(--border)}
+.tab-btn .tab-badge{background:var(--accent);color:#fff;font-size:.65rem;
+  padding:2px 6px;border-radius:999px;font-family:var(--mono)}
+
+/* ── Card ── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:28px;
+  box-shadow:0 0 0 1px rgba(255,255,255,.04),0 24px 64px rgba(0,0,0,.5);
+  animation:fadeUp .5s ease .1s both}
+
+/* ── Shared input styles ── */
+.input-row{display:flex;gap:10px;align-items:stretch;margin-bottom:6px}
+.inp-wrap{flex:1;position:relative}
+.inp-icon{position:absolute;left:14px;top:50%;transform:translateY(-50%);font-size:16px;pointer-events:none;z-index:1}
+.url-input{width:100%;background:var(--surface);border:1.5px solid var(--border);
+  border-radius:var(--radius);padding:14px 14px 14px 42px;
+  font-size:.92rem;font-family:var(--mono);color:var(--text);outline:none;
+  transition:border-color .2s,box-shadow .2s}
+.url-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-glow)}
+.url-input::placeholder{color:var(--muted)}
+.hint{font-family:var(--mono);font-size:.7rem;color:var(--muted);margin-top:5px;padding-left:2px}
+
+/* ── Buttons ── */
+.btn-red{padding:13px 20px;background:linear-gradient(135deg,var(--accent),#c0001a);
+  color:#fff;font-family:var(--font);font-weight:700;font-size:.88rem;
+  border:none;border-radius:var(--radius);cursor:pointer;white-space:nowrap;
+  transition:transform .15s,box-shadow .15s,opacity .2s;
+  box-shadow:0 4px 16px rgba(255,45,68,.35);position:relative;overflow:hidden}
+.btn-red::before{content:'';position:absolute;inset:0;
+  background:linear-gradient(135deg,rgba(255,255,255,.15),transparent)}
+.btn-red:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 8px 24px rgba(255,45,68,.45)}
+.btn-red:disabled{opacity:.5;cursor:not-allowed}
+
+.btn-full{width:100%;padding:15px;margin-top:18px;justify-content:center;
+  display:flex;align-items:center;gap:9px;font-size:.95rem;letter-spacing:.04em;text-transform:uppercase}
+
+/* ── Detected platform ── */
+.det-bar{display:none;align-items:center;gap:9px;margin-top:10px;padding:9px 14px;
+  background:var(--surface);border-radius:9px;border:1px solid var(--border);
+  font-family:var(--mono);font-size:.8rem}
+.det-bar.show{display:flex}
+.det-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+
+/* ── Error ── */
+.err-box{display:none;background:rgba(255,45,68,.08);border:1px solid rgba(255,45,68,.3);
+  border-radius:10px;padding:12px 16px;margin-top:14px;font-size:.85rem;
+  color:var(--error);font-family:var(--mono);line-height:1.5}
+.err-box.show{display:block}
+
+/* ── Loader ── */
+.loader{display:none;flex-direction:column;align-items:center;gap:14px;padding:28px 0}
+.loader.show{display:flex}
+.spinner{width:40px;height:40px;border:3px solid var(--border);
+  border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+.loader-txt{font-family:var(--mono);font-size:.8rem;color:var(--muted);letter-spacing:.05em}
+
+/* ── Single preview ── */
+.preview{display:none;margin-top:20px;animation:fadeUp .35s ease both}
+.preview.show{display:block}
+.thumb-card{background:var(--surface);border:1px solid var(--border);
+  border-radius:14px;overflow:hidden;margin-bottom:16px}
+.thumb-wrap{position:relative;width:100%;padding-top:42%;background:var(--dim);overflow:hidden}
+.thumb-wrap img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transition:transform .4s}
+.thumb-wrap:hover img{transform:scale(1.04)}
+.thumb-overlay{position:absolute;inset:0;
+  background:linear-gradient(to top,rgba(0,0,0,.65)0%,transparent 55%)}
+.plat-tag{position:absolute;top:10px;left:10px;padding:4px 11px;border-radius:7px;
+  font-family:var(--mono);font-size:.7rem;font-weight:600;letter-spacing:.06em;backdrop-filter:blur(6px)}
+.dur-tag{position:absolute;bottom:10px;right:10px;padding:3px 9px;border-radius:6px;
+  background:rgba(0,0,0,.75);color:#fff;font-family:var(--mono);font-size:.73rem}
+.thumb-meta{padding:14px 18px}
+.vid-title{font-size:1rem;font-weight:700;line-height:1.4;margin-bottom:8px;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.meta-row{display:flex;gap:14px;flex-wrap:wrap}
+.meta-it{display:flex;align-items:center;gap:4px;
+  font-family:var(--mono);font-size:.73rem;color:var(--muted)}
+
+/* ── Format selector ── */
+.sec-label{font-size:.68rem;font-weight:700;letter-spacing:.12em;color:var(--muted);
+  text-transform:uppercase;margin-bottom:9px;font-family:var(--mono)}
+.fmt-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(108px,1fr));gap:7px;margin-bottom:10px}
+.fmt-btn{background:var(--surface);border:1.5px solid var(--border);border-radius:10px;
+  padding:9px 6px;text-align:center;cursor:pointer;transition:all .2s;
+  position:relative;overflow:hidden}
+.fmt-btn:hover{border-color:var(--accent);background:var(--accent-glow)}
+.fmt-btn.sel{border-color:var(--accent);background:rgba(255,45,68,.12);
+  box-shadow:0 0 10px var(--accent-glow)}
+.fmt-btn input[type=radio]{position:absolute;opacity:0;width:0;height:0}
+.fi{font-size:1.2rem;display:block;margin-bottom:3px;pointer-events:none}
+.fl{display:block;font-size:.8rem;font-weight:600;color:var(--text);pointer-events:none}
+.fs{display:block;font-size:.66rem;font-family:var(--mono);color:var(--muted);
+  margin-top:1px;pointer-events:none}
+.divider{display:flex;align-items:center;gap:9px;margin:14px 0;
+  color:var(--dim);font-size:.68rem;font-family:var(--mono);letter-spacing:.1em}
+.divider::before,.divider::after{content:'';flex:1;height:1px;background:var(--border)}
+
+/* ── Progress bar ── */
+.prog-wrap{display:none;margin-top:14px}
+.prog-wrap.show{display:block}
+.prog-info{display:flex;justify-content:space-between;
+  font-family:var(--mono);font-size:.73rem;color:var(--muted);margin-bottom:7px}
+.prog-bg{height:5px;background:var(--dim);border-radius:999px;overflow:hidden}
+.prog-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));
+  border-radius:999px;width:0%;transition:width .4s ease}
+.prog-fill.indet{width:30%!important;animation:slide 1.5s infinite}
+
+/* ════════════════════════════════════════════
+   BATCH MODE
+   ════════════════════════════════════════════ */
+#batchPane{display:none}
+#batchPane.show{display:block}
+
+.batch-textarea{
+  width:100%;min-height:140px;resize:vertical;
+  background:var(--surface);border:1.5px solid var(--border);
+  border-radius:var(--radius);padding:14px 16px;
+  font-size:.85rem;font-family:var(--mono);color:var(--text);outline:none;
+  transition:border-color .2s,box-shadow .2s;line-height:1.7}
+.batch-textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-glow)}
+.batch-textarea::placeholder{color:var(--muted)}
+
+/* format row for batch */
+.batch-fmt-row{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0 4px}
+.bfmt{padding:7px 14px;background:var(--surface);border:1.5px solid var(--border);
+  border-radius:8px;font-family:var(--mono);font-size:.78rem;font-weight:600;
+  color:var(--muted);cursor:pointer;transition:all .2s}
+.bfmt:hover{border-color:var(--accent);color:var(--text)}
+.bfmt.sel{border-color:var(--accent);background:rgba(255,45,68,.12);
+  color:var(--accent);box-shadow:0 0 8px var(--accent-glow)}
+
+/* batch summary bar */
+.batch-summary{display:none;align-items:center;gap:10px;margin-top:12px;
+  padding:10px 16px;background:var(--surface);border-radius:10px;
+  border:1px solid var(--border);font-family:var(--mono);font-size:.8rem}
+.batch-summary.show{display:flex}
+.bs-num{font-weight:700;color:var(--accent)}
+.bs-sep{color:var(--dim)}
+
+/* overall progress */
+.overall-bar{margin-top:16px;display:none}
+.overall-bar.show{display:block}
+.overall-label{font-family:var(--mono);font-size:.72rem;color:var(--muted);
+  display:flex;justify-content:space-between;margin-bottom:6px}
+.overall-track{height:8px;background:var(--dim);border-radius:999px;overflow:hidden}
+.overall-fill{height:100%;
+  background:linear-gradient(90deg,var(--accent),var(--accent2),var(--success));
+  border-radius:999px;width:0%;transition:width .5s ease}
+
+/* batch queue list */
+.queue-list{margin-top:20px;display:flex;flex-direction:column;gap:10px}
+
+.q-item{
+  display:grid;grid-template-columns:72px 1fr auto;gap:12px;align-items:center;
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  padding:12px;transition:border-color .3s;position:relative;overflow:hidden}
+.q-item::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px}
+.q-item.waiting  {border-color:var(--border)}
+.q-item.waiting::before{background:var(--dim)}
+.q-item.fetching {border-color:#ffb83040}
+.q-item.fetching::before{background:var(--warn)}
+.q-item.queued   {border-color:#1877f240}
+.q-item.queued::before{background:#1877f2}
+.q-item.running  {border-color:rgba(255,45,68,.3)}
+.q-item.running::before{background:var(--accent);animation:pulse 1s infinite}
+.q-item.done     {border-color:rgba(0,229,160,.25)}
+.q-item.done::before{background:var(--success)}
+.q-item.error    {border-color:rgba(255,45,68,.3)}
+.q-item.error::before{background:var(--error)}
+.q-item.skipped  {border-color:var(--border);opacity:.5}
+
+.q-thumb{width:72px;height:48px;border-radius:7px;object-fit:cover;
+  background:var(--dim);flex-shrink:0;border:1px solid var(--border)}
+.q-thumb-placeholder{width:72px;height:48px;border-radius:7px;
+  background:var(--dim);border:1px solid var(--border);
+  display:grid;place-items:center;font-size:1.2rem;flex-shrink:0}
+
+.q-body{min-width:0}
+.q-title{font-size:.85rem;font-weight:600;line-height:1.3;margin-bottom:4px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.q-meta{display:flex;gap:10px;font-family:var(--mono);font-size:.68rem;color:var(--muted)}
+.q-url{font-family:var(--mono);font-size:.65rem;color:var(--muted);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+.q-prog-mini{margin-top:6px;height:3px;background:var(--dim);border-radius:999px;overflow:hidden}
+.q-prog-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));
+  border-radius:999px;width:0%;transition:width .4s}
+.q-prog-fill.indet{width:35%!important;animation:slide 1.2s infinite}
+
+.q-status{flex-shrink:0;text-align:right}
+.status-badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;
+  border-radius:999px;font-family:var(--mono);font-size:.65rem;font-weight:600;
+  letter-spacing:.04em;white-space:nowrap}
+.sb-waiting {background:var(--dim);color:var(--muted)}
+.sb-fetching{background:rgba(255,184,48,.15);color:var(--warn)}
+.sb-queued  {background:rgba(24,119,242,.15);color:#60a0ff}
+.sb-running {background:rgba(255,45,68,.15);color:var(--accent)}
+.sb-done    {background:rgba(0,229,160,.12);color:var(--success)}
+.sb-error   {background:rgba(255,45,68,.12);color:var(--error)}
+.sb-skipped {background:var(--dim);color:var(--muted)}
+
+/* btn download single item */
+.q-dl-btn{margin-top:6px;padding:3px 10px;font-family:var(--mono);font-size:.68rem;
+  font-weight:600;background:rgba(0,229,160,.12);color:var(--success);
+  border:1px solid rgba(0,229,160,.3);border-radius:6px;cursor:pointer;
+  transition:all .2s;text-decoration:none;display:inline-block}
+.q-dl-btn:hover{background:rgba(0,229,160,.2)}
+
+/* batch action buttons */
+.batch-actions{display:flex;gap:8px;margin-top:20px;flex-wrap:wrap}
+.btn-outline{padding:10px 18px;background:transparent;
+  border:1.5px solid var(--border);border-radius:10px;
+  color:var(--muted);font-family:var(--font);font-weight:600;font-size:.82rem;
+  cursor:pointer;transition:all .2s}
+.btn-outline:hover{border-color:var(--accent);color:var(--text)}
+.btn-outline:disabled{opacity:.4;cursor:not-allowed}
+
+.btn-zip{padding:10px 18px;background:linear-gradient(135deg,#00c87a,#00a060);
+  border:none;border-radius:10px;color:#fff;font-family:var(--font);
+  font-weight:700;font-size:.82rem;cursor:pointer;transition:all .2s;
+  box-shadow:0 4px 14px rgba(0,200,122,.3);display:none}
+.btn-zip.show{display:inline-flex;align-items:center;gap:7px}
+.btn-zip:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 8px 20px rgba(0,200,122,.4)}
+.btn-zip:disabled{opacity:.5;cursor:not-allowed}
+
+/* stats strip */
+.stats-strip{display:none;gap:16px;margin-top:12px;flex-wrap:wrap}
+.stats-strip.show{display:flex}
+.stat-pill{background:var(--surface);border:1px solid var(--border);
+  border-radius:8px;padding:6px 14px;font-family:var(--mono);font-size:.72rem;
+  display:flex;align-items:center;gap:6px}
+
+footer{text-align:center;margin-top:52px;font-family:var(--mono);
+  font-size:.7rem;color:var(--muted)}
+
+/* ── Animations ── */
+@keyframes fadeDown{from{opacity:0;transform:translateY(-18px)}to{opacity:1;transform:translateY(0)}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:translateY(0)}}
 @keyframes spin{to{transform:rotate(360deg)}}
-.spin{width:16px;height:16px;border-radius:50%;border:2.5px solid rgba(255,255,255,.2);border-top-color:#fff;animation:spin .7s linear infinite;display:inline-block;flex-shrink:0}
-/* Platform tag */
-.ptag{display:none;align-items:center;gap:7px;margin-top:11px;font-size:.8rem;color:var(--accent3);font-weight:500}
-.ptag.on{display:flex}
-/* Error box */
-.ebox{background:rgba(255,79,106,.07);border:1px solid rgba(255,79,106,.22);border-radius:var(--rs);padding:14px 16px;margin-top:15px;display:none;animation:su .3s ease both}
-.ebox.on{display:block}
-.etitle{font-size:.79rem;font-weight:700;color:var(--err);margin-bottom:6px}
-.emsg{font-size:.83rem;color:#ffb3bf;line-height:1.55}
-.etips{margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,79,106,.15)}
-.etips b{font-size:.77rem;color:var(--dim)}
-.etips ul{padding-left:16px;font-size:.77rem;color:var(--dim);line-height:1.75;margin-top:4px}
-/* Divider */
-hr{border:none;border-top:1px solid var(--glass-b);margin:22px 0}
-/* Info section */
-#info{display:none;margin-top:20px}
-#info.on{display:block;animation:su .4s cubic-bezier(.4,0,.2,1) both}
-@keyframes su{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
-/* Video meta */
-.vmeta{display:grid;grid-template-columns:148px 1fr;background:rgba(255,255,255,.03);border:1px solid var(--glass-b);border-radius:var(--rs);overflow:hidden}
-.tbox{position:relative;width:148px;min-height:108px;background:var(--bg3);cursor:pointer;overflow:hidden}
-.tbox img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .35s}
-.tbox:hover img{transform:scale(1.06)}
-.povr{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.42);opacity:0;transition:opacity var(--tr)}
-.tbox:hover .povr{opacity:1}
-.pico{width:40px;height:40px;border-radius:50%;background:rgba(255,255,255,.92);display:flex;align-items:center;justify-content:center}
-.mbody{padding:15px;display:flex;flex-direction:column;gap:7px;min-width:0}
-.mtitle{font-family:'Syne',sans-serif;font-weight:600;font-size:.95rem;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.mrow{display:flex;flex-wrap:wrap;gap:7px;margin-top:auto}
-.chip{display:flex;align-items:center;gap:4px;font-size:.73rem;color:var(--dim);background:rgba(255,255,255,.05);padding:3px 8px;border-radius:100px}
-/* Formats */
-.fsec{margin-top:16px}
-.flabel{font-size:.79rem;color:var(--dim);font-weight:500;margin-bottom:7px}
-.fgrid{display:flex;flex-wrap:wrap;gap:6px}
-.fbtn{background:rgba(255,255,255,.05);border:1.5px solid var(--glass-b);border-radius:7px;color:var(--dim);font-family:'DM Sans',sans-serif;font-size:.77rem;padding:5px 12px;cursor:pointer;transition:var(--tr)}
-.fbtn:hover{border-color:var(--accent);color:var(--accent)}
-.fbtn.sel{background:rgba(124,106,255,.14);border-color:var(--accent);color:var(--accent);font-weight:600}
-/* Download area */
-.dla{margin-top:18px}
-.pbar-wrap{height:3px;background:rgba(255,255,255,.07);border-radius:100px;overflow:hidden;margin-bottom:12px;display:none}
-.pbar{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent3));border-radius:100px;width:0;transition:width .3s}
-/* Modal */
-.movr{display:none;position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.86);backdrop-filter:blur(12px);align-items:center;justify-content:center;padding:20px}
-.movr.on{display:flex;animation:fi .2s ease}
-@keyframes fi{from{opacity:0}to{opacity:1}}
-.min{max-width:700px;width:100%;background:var(--bg2);border:1px solid var(--glass-b);border-radius:var(--r);overflow:hidden;animation:pi .28s cubic-bezier(.34,1.56,.64,1) both}
-@keyframes pi{from{opacity:0;transform:scale(.88)}to{opacity:1;transform:scale(1)}}
-.mhd{display:flex;align-items:center;justify-content:space-between;padding:13px 17px;border-bottom:1px solid var(--glass-b)}
-.mhd-t{font-family:'Syne',sans-serif;font-weight:600;font-size:.9rem}
-.mclose{background:none;border:none;color:var(--dim);cursor:pointer;font-size:1.25rem;line-height:1;transition:color var(--tr)}
-.mclose:hover{color:var(--text)}
-#pvideo{width:100%;max-height:68vh;background:#000}
-/* History */
-#hist{margin-top:42px;display:none}
-#hist.on{display:block}
-.shed{display:flex;align-items:center;justify-content:space-between;margin-bottom:13px}
-.shtitle{font-family:'Syne',sans-serif;font-weight:700;font-size:.98rem}
-.hlist{display:flex;flex-direction:column;gap:7px}
-.hi{display:flex;align-items:center;gap:11px;background:var(--glass);border:1px solid var(--glass-b);border-radius:var(--rs);padding:9px 11px;transition:border-color var(--tr)}
-.hi:hover{border-color:rgba(124,106,255,.22)}
-.hthumb{width:50px;height:34px;border-radius:5px;object-fit:cover;flex-shrink:0;background:var(--bg3)}
-.htitle{flex:1;font-size:.81rem;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-.hplat{font-size:.69rem;color:var(--dim);background:rgba(255,255,255,.06);padding:2px 7px;border-radius:100px;flex-shrink:0}
-.htime{font-size:.69rem;color:var(--muted);flex-shrink:0}
-/* Toast */
-.toasts{position:fixed;bottom:22px;right:22px;z-index:999;display:flex;flex-direction:column;gap:8px}
-.toast{padding:11px 15px;border-radius:var(--rs);font-size:.83rem;font-weight:500;max-width:320px;display:flex;align-items:flex-start;gap:8px;box-shadow:0 8px 26px rgba(0,0,0,.5);animation:tin .3s cubic-bezier(.34,1.56,.64,1) both}
-@keyframes tin{from{opacity:0;transform:translateX(38px)}to{opacity:1;transform:translateX(0)}}
-.t-ok{background:#0d2b1e;border:1px solid #22d87a44;color:#22d87a}
-.t-err{background:#2b0d14;border:1px solid #ff4f6a44;color:#ff4f6a}
-.t-inf{background:#151128;border:1px solid #7c6aff44;color:#a89aff}
-footer{text-align:center;color:var(--muted);font-size:.74rem;padding-top:42px}
-footer a{color:var(--dim);text-decoration:none}
-@media(max-width:500px){
-  .wrap{padding:18px 13px 56px}
-  .card{padding:15px}
-  .vmeta{grid-template-columns:1fr}
-  .tbox{width:100%;height:165px}
-  .mbody{padding:12px}
+@keyframes slide{0%{margin-left:-35%}100%{margin-left:100%}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+@media(max-width:540px){
+  .card{padding:18px}
+  .input-row{flex-direction:column}
+  .btn-red{width:100%}
+  .q-item{grid-template-columns:56px 1fr}
+  .q-status{grid-column:1/-1}
+  h1{font-size:1.7rem}
 }
 </style>
 </head>
 <body>
-<div class="blob b1"></div>
-<div class="blob b2"></div>
-<div class="blob b3"></div>
 <div class="wrap">
 
+<!-- Header -->
 <header>
-  <div class="logo">Vortex<em>DL</em></div>
-  <p class="tagline">Download video dari semua platform, cepat &amp; tanpa batas</p>
-  <div class="platforms">
-    <div class="badge"><span class="dot" style="background:#ff0000"></span>YouTube</div>
-    <div class="badge"><span class="dot" style="background:#ff0050"></span>TikTok</div>
-    <div class="badge"><span class="dot" style="background:#e1306c"></span>Instagram</div>
-    <div class="badge"><span class="dot" style="background:#1877f2"></span>Facebook</div>
-    <div class="badge"><span class="dot" style="background:#1da1f2"></span>Twitter/X</div>
+  <div class="logo-row">
+    <div class="logo-icon">⚡</div>
+    <h1>VortexDL</h1>
   </div>
+  <p class="tagline">// universal video downloader · single &amp; batch mode</p>
 </header>
 
+<!-- Tab Bar -->
+<div class="tab-bar">
+  <button class="tab-btn active" id="tabSingle" onclick="switchTab('single')">
+    🎬 Single Download
+  </button>
+  <button class="tab-btn" id="tabBatch" onclick="switchTab('batch')">
+    📦 Batch Download <span class="tab-badge">BARU</span>
+  </button>
+</div>
+
+<!-- ═══════════════════════════════════════
+     SINGLE PANE
+═══════════════════════════════════════ -->
+<div id="singlePane">
 <div class="card">
+
   <div class="input-row">
-    <input id="url-in" class="url-in" type="url"
-      placeholder="Paste URL video di sini… (YouTube, TikTok, IG, FB, X)"
-      autocomplete="off" spellcheck="false"/>
-    <button class="btn primary" id="fbtn" onclick="fetchInfo()">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-      Cari
+    <div class="inp-wrap">
+      <span class="inp-icon">🔗</span>
+      <input type="text" class="url-input" id="sUrl"
+        placeholder="Tempel link YouTube, TikTok, Instagram..."
+        autocomplete="off" spellcheck="false"/>
+    </div>
+    <button class="btn-red" id="sBtnFetch" onclick="singleFetch()">
+      <span id="sBtnTxt">Get Info</span>
     </button>
   </div>
+  <p class="hint">YouTube · TikTok · Instagram · Facebook · Twitter · Vimeo · dan banyak lagi</p>
 
-  <div class="ptag" id="ptag"><span>⚡</span><span id="pname">—</span></div>
-
-  <!-- Error box -->
-  <div class="ebox" id="ebox">
-    <div class="etitle">⚠️ Gagal Mengambil Video</div>
-    <div class="emsg" id="emsg"></div>
-    <div class="etips">
-      <b>💡 Tips untuk mengatasi:</b>
-      <ul id="etips-list"></ul>
-    </div>
+  <div class="det-bar" id="sDetBar">
+    <div class="det-dot" id="sDetDot"></div>
+    <span id="sDetLabel" style="font-weight:600"></span>
+    <span style="margin-left:auto;color:var(--success);font-size:.7rem">✓ TERDETEKSI</span>
   </div>
 
-  <!-- Info section -->
-  <div id="info">
-    <hr/>
-    <div class="vmeta">
-      <div class="tbox" onclick="openPreview()">
-        <img id="thumb" src="" alt=""/>
-        <div class="povr"><div class="pico">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="#05060a"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-        </div></div>
+  <div class="err-box" id="sErr"></div>
+
+  <div class="loader" id="sLoader">
+    <div class="spinner"></div>
+    <p class="loader-txt">Mengambil informasi video...</p>
+  </div>
+
+  <!-- Preview -->
+  <div class="preview" id="sPreview">
+
+    <div class="thumb-card">
+      <div class="thumb-wrap">
+        <img id="sThumb" src="" alt="thumb"/>
+        <div class="thumb-overlay"></div>
+        <span class="plat-tag" id="sPlatTag"></span>
+        <span class="dur-tag" id="sDurTag" style="display:none"></span>
       </div>
-      <div class="mbody">
-        <div class="mtitle" id="mtitle">—</div>
-        <div class="mrow">
-          <div class="chip" id="mdur"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg><span>—</span></div>
-          <div class="chip" id="mup"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg><span>—</span></div>
-          <div class="chip" id="mplat"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg><span>—</span></div>
+      <div class="thumb-meta">
+        <p class="vid-title" id="sTitle"></p>
+        <div class="meta-row">
+          <div class="meta-it">👤 <span id="sUploader"></span></div>
+          <div class="meta-it" id="sDurWrap">⏱ <span id="sDur"></span></div>
         </div>
       </div>
     </div>
 
-    <div class="fsec">
-      <div class="flabel">Pilih kualitas:</div>
-      <div class="fgrid" id="fgrid"></div>
+    <p class="sec-label">🎬 Format Video</p>
+    <div class="fmt-grid">
+      <label class="fmt-btn" onclick="selFmt(this,'s')">
+        <input type="radio" name="sFmt" value="360p"/>
+        <span class="fi">📺</span><span class="fl">360p</span><span class="fs">Standard</span>
+      </label>
+      <label class="fmt-btn sel" onclick="selFmt(this,'s')">
+        <input type="radio" name="sFmt" value="720p" checked/>
+        <span class="fi">🎥</span><span class="fl">720p</span><span class="fs">HD</span>
+      </label>
+      <label class="fmt-btn" onclick="selFmt(this,'s')">
+        <input type="radio" name="sFmt" value="1080p"/>
+        <span class="fi">🎞</span><span class="fl">1080p</span><span class="fs">Full HD</span>
+      </label>
+    </div>
+    <div class="divider">atau</div>
+    <div class="fmt-grid">
+      <label class="fmt-btn" onclick="selFmt(this,'s')">
+        <input type="radio" name="sFmt" value="mp3"/>
+        <span class="fi">🎵</span><span class="fl">MP3</span><span class="fs">Audio only</span>
+      </label>
     </div>
 
-    <div class="dla">
-      <div class="pbar-wrap" id="pwrap"><div class="pbar" id="pbar"></div></div>
-      <button class="btn success" id="dlbtn" onclick="startDownload()">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-        Download Video (MP4)
-      </button>
+    <button class="btn-red btn-full" id="sBtnDl" onclick="singleDl()">
+      <span>⬇</span> DOWNLOAD SEKARANG
+    </button>
+
+    <div class="prog-wrap" id="sProgWrap">
+      <div class="prog-info">
+        <span id="sProgStatus">Mempersiapkan...</span>
+        <span id="sProgPct">0%</span>
+      </div>
+      <div class="prog-bg"><div class="prog-fill" id="sProgFill"></div></div>
+    </div>
+
+  </div>
+</div>
+</div><!-- /singlePane -->
+
+
+<!-- ═══════════════════════════════════════
+     BATCH PANE
+═══════════════════════════════════════ -->
+<div id="batchPane">
+<div class="card">
+
+  <p class="sec-label" style="margin-bottom:10px">📋 Tempel Link (satu per baris)</p>
+  <textarea class="batch-textarea" id="bTextarea"
+    placeholder="https://youtube.com/watch?v=xxxxx&#10;https://vt.tiktok.com/xxxxx&#10;https://instagram.com/reel/xxxxx&#10;https://vimeo.com/xxxxx&#10;..."></textarea>
+  <p class="hint">Maksimal 20 link sekaligus · Satu URL per baris</p>
+
+  <!-- Format pilihan untuk batch -->
+  <p class="sec-label" style="margin-top:16px;margin-bottom:8px">🎬 Format untuk semua link</p>
+  <div class="batch-fmt-row">
+    <button class="bfmt" onclick="selBFmt(this,'360p')">📺 360p</button>
+    <button class="bfmt sel" onclick="selBFmt(this,'720p')">🎥 720p HD</button>
+    <button class="bfmt" onclick="selBFmt(this,'1080p')">🎞 1080p</button>
+    <button class="bfmt" onclick="selBFmt(this,'mp3')">🎵 MP3 Audio</button>
+  </div>
+
+  <!-- Summary bar -->
+  <div class="batch-summary" id="bSummary">
+    <span class="bs-num" id="bCount">0</span>
+    <span class="bs-sep">link terdeteksi</span>
+    <span id="bPlatList" style="color:var(--muted);font-size:.72rem;margin-left:4px"></span>
+  </div>
+
+  <div class="err-box" id="bErr"></div>
+
+  <!-- Action buttons -->
+  <div class="batch-actions">
+    <button class="btn-red" id="bBtnStart" onclick="batchStart()">
+      ⚡ Mulai Antrian Download
+    </button>
+    <button class="btn-outline" id="bBtnClear" onclick="batchClear()">
+      🗑 Bersihkan
+    </button>
+    <button class="btn-zip" id="bBtnZip" onclick="batchZip()">
+      🗜 Download Semua (ZIP)
+    </button>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats-strip" id="bStats">
+    <div class="stat-pill">✅ <span id="statDone">0</span> selesai</div>
+    <div class="stat-pill">⏳ <span id="statPending">0</span> antrian</div>
+    <div class="stat-pill">❌ <span id="statErr">0</span> gagal</div>
+  </div>
+
+  <!-- Overall progress -->
+  <div class="overall-bar" id="overallBar">
+    <div class="overall-label">
+      <span id="overallStatus">Memproses antrian...</span>
+      <span id="overallPct">0%</span>
+    </div>
+    <div class="overall-track">
+      <div class="overall-fill" id="overallFill"></div>
     </div>
   </div>
-</div>
 
-<!-- History -->
-<div id="hist">
-  <hr style="margin-top:36px"/>
-  <div class="shed">
-    <div class="shtitle">📋 Riwayat Download</div>
-    <button class="btn ghost" onclick="clearHist()">Hapus semua</button>
-  </div>
-  <div class="hlist" id="hlist"></div>
-</div>
+  <!-- Queue list -->
+  <div class="queue-list" id="queueList"></div>
 
-<footer>
-  VortexDL — Untuk penggunaan pribadi. Hormati hak cipta konten. |
-  Powered by <a href="https://github.com/yt-dlp/yt-dlp" target="_blank">yt-dlp</a>
-</footer>
 </div>
+</div><!-- /batchPane -->
 
-<!-- Preview Modal -->
-<div class="movr" id="modal" onclick="closeModal(event)">
-  <div class="min">
-    <div class="mhd">
-      <span class="mhd-t" id="mtitle2">Preview</span>
-      <button class="mclose" onclick="closeModalDirect()">✕</button>
-    </div>
-    <video id="pvideo" controls playsinline></video>
-  </div>
-</div>
-
-<div class="toasts" id="toasts"></div>
+<footer>⚡ VortexDL v4.0 · Single &amp; Batch Download · Powered by Flask + yt-dlp</footer>
+</div><!-- /wrap -->
 
 <script>
-let info = null, selFmt = null;
-let hist = JSON.parse(sessionStorage.getItem('vdl_h') || '[]');
+// ═══════════════════════════════════════════════
+//  SHARED UTILS
+// ═══════════════════════════════════════════════
+const PLATS = [
+  ["youtube.com",    "YouTube",    "▶", "#ff0000"],
+  ["youtu.be",       "YouTube",    "▶", "#ff0000"],
+  ["tiktok.com",     "TikTok",     "♪", "#69c9d0"],
+  ["instagram.com",  "Instagram",  "◈", "#e1306c"],
+  ["facebook.com",   "Facebook",   "f", "#1877f2"],
+  ["fb.watch",       "Facebook",   "f", "#1877f2"],
+  ["twitter.com",    "Twitter/X",  "𝕏", "#1da1f2"],
+  ["x.com",          "Twitter/X",  "𝕏", "#1da1f2"],
+  ["reddit.com",     "Reddit",     "⬆","#ff4500"],
+  ["vimeo.com",      "Vimeo",      "V", "#1ab7ea"],
+  ["dailymotion.com","Dailymotion","D", "#0066dc"],
+  ["twitch.tv",      "Twitch",     "⬛","#9146ff"],
+  ["pinterest.com",  "Pinterest",  "P", "#e60023"],
+  ["linkedin.com",   "LinkedIn",  "in", "#0a66c2"],
+  ["soundcloud.com", "SoundCloud", "☁","#ff5500"],
+  ["rumble.com",     "Rumble",     "R", "#85c742"],
+  ["bilibili.com",   "Bilibili",   "B", "#00a1d6"],
+  ["ted.com",        "TED",        "T", "#e62b1e"],
+  ["loom.com",       "Loom",       "L", "#625df5"],
+  ["ucshare.com",    "UCShare",    "U", "#f5a623"],
+  ["uc.cn",          "UCShare",    "U", "#f5a623"],
+];
 
-const PL = {
-  youtube:'▶ YouTube', tiktok:'♪ TikTok',
-  instagram:'◈ Instagram', facebook:'ƒ Facebook',
-  twitter:'✦ Twitter/X'
-};
-
-const TIPS = {
-  login:   ['Pastikan video bersifat publik (bukan Privat atau "Hanya Teman")',
-            'Buka link di browser tanpa login — jika tidak bisa terbuka, video memang privat',
-            'Untuk Instagram Reels: salin link dari ikon Share → Salin Tautan',
-            'Untuk TikTok: hanya video publik yang bisa diunduh'],
-  geo:     ['Video dibatasi geografis — server tidak bisa mengaksesnya',
-            'Coba platform lain atau video dari kreator yang tidak membatasi wilayah'],
-  age:     ['Video memerlukan verifikasi usia akun',
-            'Tidak dapat diakses tanpa akun yang sudah diverifikasi umur'],
-  removed: ['Video kemungkinan sudah dihapus pemilik atau dikenai copyright',
-            'Coba buka link di browser — jika "Video Unavailable", video memang sudah hilang'],
-  url:     ['Pastikan link mengarah langsung ke video, bukan ke profil atau beranda',
-            'YouTube: gunakan youtube.com/watch?v=... atau youtu.be/...',
-            'TikTok: Share video → Copy Link (bukan salin alamat bar)',
-            'Instagram: link harus ke postingan/Reels, bukan ke profil (@username)',
-            'Facebook: link video publik (bukan video dari grup privat)'],
-  rate:    ['Server terlalu banyak permintaan ke platform ini', 'Tunggu 1–2 menit lalu coba lagi'],
-  generic: ['Pastikan URL bisa dibuka di browser terlebih dahulu',
-            'Coba update yt-dlp: pip install -U yt-dlp',
-            'Beberapa video memang tidak dapat didownload karena kebijakan platform']
-};
-
-function getCategory(msg) {
-  const m = msg.toLowerCase();
-  if (/privat|private|login|sign in|members only|who can watch/.test(m)) return 'login';
-  if (/geo|negara|country|blocked in/.test(m)) return 'geo';
-  if (/usia|age|18\+|adult/.test(m)) return 'age';
-  if (/dihapus|removed|deleted|unavailable|no longer/.test(m)) return 'removed';
-  if (/url|dikenali|unsupported/.test(m)) return 'url';
-  if (/rate limit|429|terlalu banyak/.test(m)) return 'rate';
-  return 'generic';
+function detectPlat(url) {
+  const u = url.toLowerCase();
+  for (const [kw, name, emoji, color] of PLATS) {
+    if (u.includes(kw)) return { name, emoji, color };
+  }
+  return null;
 }
 
-function toast(msg, type='info', ms=4200) {
-  const w = document.getElementById('toasts');
-  const el = document.createElement('div');
-  el.className = `toast t-${type}`;
-  el.textContent = (type==='ok'?'✅ ':type==='err'?'❌ ':'💬 ') + msg;
-  w.appendChild(el);
-  setTimeout(()=>{el.style.cssText='opacity:0;transform:translateX(38px);transition:.35s';
-    setTimeout(()=>el.remove(),370)},ms);
+function fmtDur(sec) {
+  if (!sec) return '';
+  const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=Math.floor(sec%60);
+  return h>0?`${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`:`${m}:${String(s).padStart(2,'0')}`;
 }
 
-function showErr(msg) {
-  document.getElementById('emsg').textContent = msg;
-  const cat  = getCategory(msg);
-  const tips = TIPS[cat] || TIPS.generic;
-  document.getElementById('etips-list').innerHTML = tips.map(t=>`<li>${t}</li>`).join('');
-  document.getElementById('ebox').classList.add('on');
-  document.getElementById('info').classList.remove('on');
-}
-function hideErr() { document.getElementById('ebox').classList.remove('on'); }
-
-function detectPlatform(u) {
-  if (/youtube\.com|youtu\.be/i.test(u))       return 'youtube';
-  if (/tiktok\.com|vm\.tiktok\.com/i.test(u))  return 'tiktok';
-  if (/instagram\.com/i.test(u))               return 'instagram';
-  if (/facebook\.com|fb\.watch/i.test(u))      return 'facebook';
-  if (/twitter\.com|x\.com/i.test(u))          return 'twitter';
-  return 'unknown';
+function triggerDownload(blob, filename) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a); a.click();
+  URL.revokeObjectURL(a.href); a.remove();
 }
 
-document.getElementById('url-in').addEventListener('input', function() {
-  hideErr();
-  const p = detectPlatform(this.value.trim());
-  const t = document.getElementById('ptag');
-  if (p !== 'unknown') {
-    document.getElementById('pname').textContent = PL[p];
-    t.classList.add('on');
-  } else t.classList.remove('on');
+function getFilename(resp, fallback) {
+  const d = resp.headers.get('Content-Disposition') || '';
+  const m = d.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)["']?/i);
+  return m ? decodeURIComponent(m[1].trim()) : fallback;
+}
+
+// ═══════════════════════════════════════════════
+//  TAB SWITCHER
+// ═══════════════════════════════════════════════
+function switchTab(tab) {
+  document.getElementById('singlePane').style.display = tab==='single' ? '' : 'none';
+  document.getElementById('batchPane').classList.toggle('show', tab==='batch');
+  document.getElementById('tabSingle').classList.toggle('active', tab==='single');
+  document.getElementById('tabBatch').classList.toggle('active',  tab==='batch');
+}
+
+// ═══════════════════════════════════════════════
+//  SINGLE MODE
+// ═══════════════════════════════════════════════
+let sCurrentUrl = '', sPollInterval = null;
+
+document.getElementById('sUrl').addEventListener('input', function() {
+  const p = detectPlat(this.value.trim());
+  const bar = document.getElementById('sDetBar');
+  if (p) {
+    bar.classList.add('show');
+    document.getElementById('sDetDot').style.background  = p.color;
+    document.getElementById('sDetLabel').textContent = `${p.emoji} ${p.name}`;
+  } else bar.classList.remove('show');
 });
-document.getElementById('url-in').addEventListener('keydown', e => {
-  if (e.key === 'Enter') fetchInfo();
-});
+document.getElementById('sUrl').addEventListener('keydown', e => { if(e.key==='Enter') singleFetch(); });
 
-async function fetchInfo() {
-  const url = document.getElementById('url-in').value.trim();
-  if (!url) { toast('Masukkan URL video dulu', 'err'); return; }
+function selFmt(el, prefix) {
+  document.querySelectorAll(`.fmt-btn`).forEach(b => b.classList.remove('sel'));
+  el.classList.add('sel');
+}
 
-  const btn = document.getElementById('fbtn');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span> Mengambil…';
-  hideErr();
-  document.getElementById('info').classList.remove('on');
+function showSErr(msg) { const e=document.getElementById('sErr'); e.innerHTML='⚠ '+msg; e.classList.add('show'); }
+function hideSErr()    { document.getElementById('sErr').classList.remove('show'); }
+
+async function singleFetch() {
+  const url = document.getElementById('sUrl').value.trim();
+  if (!url) { showSErr('Masukkan URL terlebih dahulu.'); return; }
+  const p = detectPlat(url);
+  if (!p) { showSErr('Platform tidak dikenali.'); return; }
+
+  hideSErr(); sCurrentUrl = url;
+  document.getElementById('sLoader').classList.add('show');
+  document.getElementById('sPreview').classList.remove('show');
+  document.getElementById('sBtnFetch').disabled = true;
+  document.getElementById('sBtnTxt').textContent = 'Memuat...';
 
   try {
-    const res  = await fetch('/api/info', {method:'POST',
-      headers:{'Content-Type':'application/json'}, body:JSON.stringify({url})});
-    const data = await res.json();
-    if (!res.ok || data.error) { showErr(data.error || 'Gagal mengambil info video'); return; }
+    const resp = await fetch('/api/info', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url})
+    });
+    const data = await resp.json();
+    document.getElementById('sLoader').classList.remove('show');
 
-    info    = data;
-    selFmt  = data.formats?.[0]?.format_id || 'best';
-    renderInfo(data);
-    document.getElementById('info').classList.add('on');
+    if (!data.success) { showSErr(data.error||'Gagal.'); return; }
+    const info = data.info;
+
+    // thumbnail
+    const img = document.getElementById('sThumb');
+    img.src = info.thumbnail || `https://placehold.co/640x360/0e1319/333?text=${encodeURIComponent(p.name)}`;
+    img.onerror = () => img.src = `https://placehold.co/640x360/0e1319/333?text=${encodeURIComponent(p.name)}`;
+
+    const tag = document.getElementById('sPlatTag');
+    tag.textContent = `${p.emoji} ${p.name}`;
+    tag.style.cssText = `background:${p.color}22;color:${p.color};border:1px solid ${p.color}44`;
+
+    const dur = fmtDur(info.duration);
+    const durTag = document.getElementById('sDurTag');
+    if (dur) { durTag.textContent=dur; durTag.style.display=''; } else durTag.style.display='none';
+
+    document.getElementById('sTitle').textContent    = info.title    || 'Tanpa Judul';
+    document.getElementById('sUploader').textContent = info.uploader || 'Unknown';
+    if (dur) document.getElementById('sDur').textContent = dur;
+    else document.getElementById('sDurWrap').style.display='none';
+
+    document.getElementById('sPreview').classList.add('show');
+    document.getElementById('sProgWrap').classList.remove('show');
+    document.getElementById('sBtnDl').disabled = false;
+
   } catch(e) {
-    showErr('Koneksi gagal. Periksa koneksi internet kamu.');
+    document.getElementById('sLoader').classList.remove('show');
+    showSErr('Kesalahan jaringan. Coba lagi.');
   } finally {
-    btn.disabled = false;
-    btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Cari';
+    document.getElementById('sBtnFetch').disabled = false;
+    document.getElementById('sBtnTxt').textContent = 'Get Info';
   }
 }
 
-function renderInfo(d) {
-  const img = document.getElementById('thumb');
-  img.src = d.thumbnail || '';
-  img.onerror = () => { img.src = ''; img.style.background = 'var(--bg3)'; };
-  document.getElementById('mtitle').textContent  = d.title || 'Tanpa Judul';
-  document.getElementById('mtitle2').textContent = d.title || 'Preview';
-  document.getElementById('mdur').querySelector('span').textContent   = d.duration || 'N/A';
-  document.getElementById('mup').querySelector('span').textContent    = d.uploader || 'N/A';
-  document.getElementById('mplat').querySelector('span').textContent  = PL[d.platform] || d.platform;
+async function singleDl() {
+  if (!sCurrentUrl) return;
+  const fmt = document.querySelector('input[name="sFmt"]:checked')?.value || '720p';
+  const sid = Math.random().toString(36).substring(2);
 
-  const grid = document.getElementById('fgrid');
-  grid.innerHTML = '';
-  (d.formats || []).forEach((f, i) => {
-    const b = document.createElement('button');
-    b.className = 'fbtn' + (i === 0 ? ' sel' : '');
-    b.dataset.fid = f.format_id;
-    const au = f.has_audio ? '🔊' : '🔇';
-    b.textContent = `${f.label} ${au}${f.filesize !== 'N/A' ? ' · ' + f.filesize : ''}`.trim();
-    b.onclick = () => {
-      document.querySelectorAll('.fbtn').forEach(x => x.classList.remove('sel'));
-      b.classList.add('sel');
-      selFmt = f.format_id;
-    };
-    grid.appendChild(b);
-  });
-}
-
-async function startDownload() {
-  if (!info) { toast('Cari video dulu', 'err'); return; }
-
-  const btn  = document.getElementById('dlbtn');
-  const pw   = document.getElementById('pwrap');
-  const pb   = document.getElementById('pbar');
-
+  const btn = document.getElementById('sBtnDl');
   btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span> Memproses & Mengunduh…';
-  pw.style.display = 'block';
-  pb.style.width = '5%';
+  btn.innerHTML = '<span class="spinner" style="width:16px;height:16px;border-width:2px;display:inline-block;margin-right:8px;vertical-align:middle"></span>Memproses...';
 
-  let pct = 5;
-  const pi = setInterval(() => {
-    if (pct < 80) { pct += Math.random() * 5.5; pb.style.width = Math.min(pct, 80) + '%'; }
-  }, 550);
+  const pw=document.getElementById('sProgWrap'), pf=document.getElementById('sProgFill');
+  const ps=document.getElementById('sProgStatus'), pp=document.getElementById('sProgPct');
+  pw.classList.add('show'); pf.classList.add('indet');
+  ps.textContent='Memulai...'; pp.textContent='...';
+
+  if (sPollInterval) clearInterval(sPollInterval);
+  sPollInterval = setInterval(async()=>{
+    try {
+      const r=await fetch(`/api/progress/${sid}`);
+      const d=await r.json();
+      if(d.percent!==undefined){
+        pf.classList.remove('indet'); pf.style.width=d.percent+'%';
+        pp.textContent=d.percent+'%'; ps.textContent=d.status||'Downloading...';
+      }
+    }catch{}
+  },800);
 
   try {
-    const res = await fetch('/download', {method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({url:info.original_url, format_id:selFmt||'best'})});
+    const resp = await fetch('/api/download',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({url:sCurrentUrl,format:fmt,session_id:sid})
+    });
+    clearInterval(sPollInterval); pf.classList.remove('indet');
 
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      showErr(err.error || 'Download gagal');
-      return;
+    if (!resp.ok) {
+      const e=await resp.json().catch(()=>({}));
+      showSErr(e.error||'Download gagal.'); pw.classList.remove('show');
+    } else {
+      pf.style.width='100%'; ps.textContent='✓ Download selesai!'; pp.textContent='100%';
+      const blob=await resp.blob();
+      triggerDownload(blob, getFilename(resp,'video.mp4'));
+    }
+  } catch(e) {
+    clearInterval(sPollInterval);
+    showSErr('Download gagal. Periksa koneksi.'); pw.classList.remove('show');
+  } finally {
+    btn.disabled=false; btn.innerHTML='<span>⬇</span> DOWNLOAD SEKARANG';
+  }
+}
+
+// ═══════════════════════════════════════════════
+//  BATCH MODE
+// ═══════════════════════════════════════════════
+let bFmt      = '720p';
+let bItems    = [];    // [{id, url, status, info, file_id}]
+let bRunning  = false;
+let bDoneFiles = [];   // [{file_id, filename}] for ZIP
+
+function selBFmt(el, fmt) {
+  document.querySelectorAll('.bfmt').forEach(b=>b.classList.remove('sel'));
+  el.classList.add('sel');
+  bFmt = fmt;
+}
+
+// Live parse textarea
+document.getElementById('bTextarea').addEventListener('input', parseTextarea);
+
+function parseTextarea() {
+  const lines = document.getElementById('bTextarea').value
+    .split('\n').map(l=>l.trim()).filter(l=>l.length>0);
+
+  const valid = lines.filter(l => detectPlat(l));
+  const summary = document.getElementById('bSummary');
+
+  if (valid.length > 0) {
+    summary.classList.add('show');
+    document.getElementById('bCount').textContent = valid.length;
+    // unique platforms
+    const platSet = new Set(valid.map(u => detectPlat(u)?.name).filter(Boolean));
+    document.getElementById('bPlatList').textContent = '· ' + [...platSet].join(', ');
+  } else {
+    summary.classList.remove('show');
+  }
+}
+
+function showBErr(msg) { const e=document.getElementById('bErr'); e.innerHTML='⚠ '+msg; e.classList.add('show'); }
+function hideBErr()    { document.getElementById('bErr').classList.remove('show'); }
+
+function batchClear() {
+  document.getElementById('bTextarea').value = '';
+  document.getElementById('queueList').innerHTML = '';
+  document.getElementById('bSummary').classList.remove('show');
+  document.getElementById('bStats').classList.remove('show');
+  document.getElementById('overallBar').classList.remove('show');
+  document.getElementById('bBtnZip').classList.remove('show');
+  hideBErr();
+  bItems = []; bDoneFiles = []; bRunning = false;
+  updateStats();
+}
+
+async function batchStart() {
+  if (bRunning) return;
+
+  const lines = document.getElementById('bTextarea').value
+    .split('\n').map(l=>l.trim()).filter(l=>l.length>0);
+
+  const valid = lines.filter(l=>detectPlat(l));
+  if (valid.length === 0) { showBErr('Tidak ada URL yang valid. Periksa kembali link-nya.'); return; }
+  if (valid.length > 20)  { showBErr('Maksimal 20 link sekaligus.'); return; }
+
+  hideBErr();
+  bItems    = [];
+  bDoneFiles= [];
+  bRunning  = true;
+
+  document.getElementById('bBtnStart').disabled = true;
+  document.getElementById('bBtnZip').classList.remove('show');
+  document.getElementById('overallBar').classList.add('show');
+  document.getElementById('bStats').classList.add('show');
+  document.getElementById('queueList').innerHTML = '';
+
+  // Build item list & render cards
+  for (const url of valid) {
+    const id   = 'b_' + Math.random().toString(36).substring(2,8);
+    const plat = detectPlat(url);
+    bItems.push({ id, url, status:'waiting', info:null, plat, file_id:null });
+    renderQItem(bItems[bItems.length-1]);
+  }
+
+  updateStats();
+  updateOverall();
+
+  // Step 1: fetch info for all items
+  for (const item of bItems) {
+    setItemStatus(item, 'fetching', 'Mengambil info...');
+    try {
+      const resp = await fetch('/api/info',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({url:item.url})
+      });
+      const data = await resp.json();
+      if (data.success) {
+        item.info = data.info;
+        updateQItemInfo(item);
+        setItemStatus(item,'queued','Menunggu giliran');
+      } else {
+        setItemStatus(item,'error', data.error||'Gagal fetch info');
+      }
+    } catch(e) {
+      setItemStatus(item,'error','Koneksi gagal');
+    }
+    updateStats(); updateOverall();
+  }
+
+  // Step 2: download one by one
+  for (const item of bItems) {
+    if (item.status === 'error') continue;
+    setItemStatus(item,'running','Downloading...');
+    updateStats(); updateOverall();
+
+    const sid = Math.random().toString(36).substring(2);
+    item.file_id = sid;
+
+    // mini progress polling
+    const poll = setInterval(async()=>{
+      try {
+        const r=await fetch(`/api/progress/${sid}`);
+        const d=await r.json();
+        setItemProgress(item.id, d.percent||0, d.status||'');
+      }catch{}
+    },800);
+
+    try {
+      const resp = await fetch('/api/download',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({url:item.url, format:bFmt, session_id:sid, save_for_zip:true})
+      });
+      clearInterval(poll);
+
+      if (!resp.ok) {
+        const e=await resp.json().catch(()=>({}));
+        setItemStatus(item,'error', e.error||'Download gagal');
+      } else {
+        setItemProgress(item.id,100,'✓ Selesai');
+        setItemStatus(item,'done','✓ Selesai');
+        // offer individual download
+        const blob = await resp.blob();
+        const fname = getFilename(resp, `video_${item.id}.mp4`);
+        bDoneFiles.push({id:item.id, blob, fname});
+        addItemDlBtn(item.id, blob, fname);
+      }
+    } catch(e) {
+      clearInterval(poll);
+      setItemStatus(item,'error','Download error');
     }
 
-    clearInterval(pi);
-    pb.style.width = '100%';
+    updateStats(); updateOverall();
+    // small delay between downloads
+    await new Promise(r=>setTimeout(r,600));
+  }
 
-    const blob = await res.blob();
-    const name = res.headers.get('Content-Disposition')?.match(/filename="(.+)"/)?.[1] || 'video.mp4';
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob); a.download = name;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+  bRunning = false;
+  document.getElementById('bBtnStart').disabled = false;
+  if (bDoneFiles.length > 1) document.getElementById('bBtnZip').classList.add('show');
+  updateOverall();
+}
 
-    toast('Download berhasil! 🎉', 'ok');
-    addHist(info);
+// ── Batch ZIP ──
+async function batchZip() {
+  if (bDoneFiles.length === 0) return;
+  const btn = document.getElementById('bBtnZip');
+  btn.disabled = true; btn.innerHTML = '⏳ Membuat ZIP...';
+
+  try {
+    // Use server-side zip
+    const ids = bDoneFiles.map(f=>f.id);
+    const resp = await fetch('/api/batch_zip',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({file_ids: ids})
+    });
+    if (resp.ok) {
+      const blob = await resp.blob();
+      triggerDownload(blob, getFilename(resp,'vortexdl_batch.zip'));
+    } else {
+      // fallback: individual
+      alert('ZIP server tidak tersedia. Silakan download satu per satu.');
+    }
   } catch(e) {
-    showErr('Download gagal: ' + e.message);
-    clearInterval(pi);
+    alert('Gagal membuat ZIP. Download satu per satu ya.');
   } finally {
-    btn.disabled = false;
-    btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Download Video (MP4)';
-    setTimeout(() => { pw.style.display = 'none'; pb.style.width = '0'; }, 1400);
+    btn.disabled = false; btn.innerHTML = '🗜 Download Semua (ZIP)';
   }
 }
 
-function openPreview() {
-  if (!info?.original_url) return;
-  document.getElementById('pvideo').src = info.original_url;
-  document.getElementById('modal').classList.add('on');
+// ── Render helpers ──
+function renderQItem(item) {
+  const qList = document.getElementById('queueList');
+  const el = document.createElement('div');
+  el.className = 'q-item waiting';
+  el.id = 'qi_' + item.id;
+  const plat = item.plat || {};
+  const shortUrl = item.url.length > 55 ? item.url.substring(0,55)+'…' : item.url;
+  el.innerHTML = `
+    <div class="q-thumb-placeholder" id="qtp_${item.id}">${plat.emoji||'🎬'}</div>
+    <div class="q-body">
+      <div class="q-title" id="qt_${item.id}">${shortUrl}</div>
+      <div class="q-meta">
+        <span style="color:${plat.color||'var(--muted)'}">${plat.name||'Unknown'}</span>
+        <span id="qm_${item.id}"></span>
+      </div>
+      <div class="q-prog-mini"><div class="q-prog-fill" id="qp_${item.id}"></div></div>
+      <div id="qdl_${item.id}"></div>
+    </div>
+    <div class="q-status">
+      <span class="status-badge sb-waiting" id="qb_${item.id}">⏸ Menunggu</span>
+    </div>`;
+  qList.appendChild(el);
 }
-function closeModalDirect() {
-  const v = document.getElementById('pvideo');
-  v.pause(); v.src = '';
-  document.getElementById('modal').classList.remove('on');
-}
-function closeModal(e) { if (e.target.id === 'modal') closeModalDirect(); }
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModalDirect(); });
 
-function addHist(d) {
-  hist.unshift({title:d.title, thumbnail:d.thumbnail, platform:d.platform,
-    url:d.original_url, time:new Date().toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'})});
-  if (hist.length > 20) hist.pop();
-  sessionStorage.setItem('vdl_h', JSON.stringify(hist));
-  renderHist();
+function updateQItemInfo(item) {
+  const info = item.info;
+  if (!info) return;
+  const title = (info.title||'').substring(0,60) || item.url.substring(0,40);
+  const el_t = document.getElementById('qt_'+item.id);
+  if (el_t) el_t.textContent = title;
+
+  const dur = fmtDur(info.duration);
+  const el_m = document.getElementById('qm_'+item.id);
+  if (el_m && dur) el_m.textContent = '· ' + dur;
+
+  // thumbnail
+  if (info.thumbnail) {
+    const tp = document.getElementById('qtp_'+item.id);
+    if (tp) {
+      const img = document.createElement('img');
+      img.className = 'q-thumb';
+      img.src = info.thumbnail;
+      img.onerror = () => {};
+      tp.replaceWith(img);
+    }
+  }
 }
-function renderHist() {
-  const sec = document.getElementById('hist');
-  const ul  = document.getElementById('hlist');
-  if (!hist.length) { sec.classList.remove('on'); return; }
-  sec.classList.add('on');
-  ul.innerHTML = hist.map(h => `
-    <div class="hi">
-      <img class="hthumb" src="${e(h.thumbnail)}" alt="" onerror="this.src='';this.style.background='var(--bg3)'">
-      <div class="htitle" title="${e(h.title)}">${e(h.title)}</div>
-      <div class="hplat">${PL[h.platform]||h.platform}</div>
-      <div class="htime">${h.time}</div>
-    </div>`).join('');
+
+const STATUS_MAP = {
+  waiting:  ['waiting',  'sb-waiting',  '⏸ Menunggu'],
+  fetching: ['fetching', 'sb-fetching', '🔍 Mengambil info...'],
+  queued:   ['queued',   'sb-queued',   '🕐 Antrian'],
+  running:  ['running',  'sb-running',  '⬇ Downloading'],
+  done:     ['done',     'sb-done',     '✓ Selesai'],
+  error:    ['error',    'sb-error',    '✗ Gagal'],
+  skipped:  ['skipped',  'sb-skipped',  '— Dilewati'],
+};
+
+function setItemStatus(item, status, msg) {
+  item.status = status;
+  const el  = document.getElementById('qi_'+item.id);
+  const badge = document.getElementById('qb_'+item.id);
+  if (!el || !badge) return;
+  const [cls, bcls, label] = STATUS_MAP[status] || STATUS_MAP.waiting;
+  el.className = 'q-item ' + cls;
+  badge.className = 'status-badge ' + bcls;
+  badge.textContent = label;
 }
-function clearHist() {
-  hist = []; sessionStorage.removeItem('vdl_h'); renderHist();
-  toast('Riwayat dihapus', 'inf', 2000);
+
+function setItemProgress(id, pct, statusTxt) {
+  const fill = document.getElementById('qp_'+id);
+  if (!fill) return;
+  if (pct >= 100) { fill.classList.remove('indet'); fill.style.width='100%'; }
+  else if (pct > 0) { fill.classList.remove('indet'); fill.style.width=pct+'%'; }
+  else { fill.classList.add('indet'); }
 }
-const e = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-renderHist();
+
+function addItemDlBtn(id, blob, fname) {
+  const cont = document.getElementById('qdl_'+id);
+  if (!cont) return;
+  const btn = document.createElement('a');
+  btn.className = 'q-dl-btn';
+  btn.textContent = '⬇ Simpan file';
+  btn.href = URL.createObjectURL(blob);
+  btn.download = fname;
+  cont.appendChild(btn);
+}
+
+function updateStats() {
+  const done    = bItems.filter(i=>i.status==='done').length;
+  const pending = bItems.filter(i=>['waiting','queued','running','fetching'].includes(i.status)).length;
+  const err     = bItems.filter(i=>i.status==='error').length;
+  document.getElementById('statDone').textContent    = done;
+  document.getElementById('statPending').textContent = pending;
+  document.getElementById('statErr').textContent     = err;
+}
+
+function updateOverall() {
+  const total   = bItems.length;
+  if (total === 0) return;
+  const done    = bItems.filter(i=>['done','error','skipped'].includes(i.status)).length;
+  const pct     = Math.round(done/total*100);
+  document.getElementById('overallFill').style.width = pct+'%';
+  document.getElementById('overallPct').textContent  = pct+'%';
+  const running = bItems.find(i=>i.status==='running');
+  if (running?.info?.title) {
+    document.getElementById('overallStatus').textContent = `⬇ ${running.info.title.substring(0,40)}`;
+  } else if (pct===100) {
+    document.getElementById('overallStatus').textContent = `✓ Semua selesai (${total} item)`;
+  } else {
+    document.getElementById('overallStatus').textContent = `Memproses ${done}/${total} item...`;
+  }
+}
 </script>
 </body>
-</html>"""
+</html>
+"""
+
+# ─────────────────────────────────────────────────────────────
+#  ROUTES — SINGLE
+# ─────────────────────────────────────────────────────────────
+@app.route("/")
+def index():
+    return render_template_string(HTML)
+
+
+@app.route("/api/info", methods=["POST"])
+def api_info():
+    data = request.get_json() or {}
+    url  = data.get("url","").strip()
+    if not url:
+        return jsonify({"success":False,"error":"URL tidak boleh kosong."})
+    if not detect_platform(url):
+        return jsonify({"success":False,"error":"Platform tidak dikenali."})
+
+    # ── UCShare: custom extractor ──
+    if is_ucshare(url):
+        try:
+            info = ucshare_extract_info(url)
+            return jsonify({"success":True,"info":{
+                "title":    info["title"],
+                "uploader": info["uploader"],
+                "duration": info["duration"],
+                "thumbnail":info["thumbnail"],
+                "platform": "UCShare",
+            }})
+        except Exception as e:
+            return jsonify({"success":False,"error":f"UCShare: {str(e)[:180]}"})
+
+    opts = base_ydl_opts()
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        entries = info.get("entries") or []
+        if entries:
+            first    = next((e for e in entries if e), info)
+            thumb    = pick_thumbnail(first) or pick_thumbnail(info)
+            title    = info.get("title") or first.get("title") or "Tanpa Judul"
+            uploader = (info.get("uploader") or first.get("uploader")
+                        or info.get("channel") or "Unknown")
+            duration = first.get("duration")
+        else:
+            thumb    = pick_thumbnail(info)
+            title    = info.get("title") or "Tanpa Judul"
+            uploader = info.get("uploader") or info.get("channel") or "Unknown"
+            duration = info.get("duration")
+
+        plat = detect_platform(url)
+        return jsonify({"success":True,"info":{
+            "title":title,"uploader":uploader,"duration":duration,
+            "thumbnail":thumb,"platform":plat[0] if plat else "Unknown",
+        }})
+
+    except yt_dlp.utils.DownloadError as e:
+        msg = str(e).lower()
+        if "private"   in msg: err="Konten ini bersifat private."
+        elif "removed" in msg or "deleted" in msg: err="Konten telah dihapus."
+        elif "age"     in msg: err="Konten memerlukan verifikasi usia."
+        elif "unavailable" in msg: err="Konten tidak tersedia di wilayah ini."
+        else: err="Gagal memuat konten. Periksa URL-nya."
+        return jsonify({"success":False,"error":err})
+    except Exception as e:
+        return jsonify({"success":False,"error":f"Error: {str(e)[:120]}"})
+
+
+@app.route("/api/download", methods=["POST"])
+def api_download():
+    data       = request.get_json() or {}
+    url        = data.get("url","").strip()
+    fmt        = data.get("format","720p")
+    session_id = data.get("session_id", str(uuid.uuid4()))
+    save_zip   = data.get("save_for_zip", False)  # keep file for zip later
+
+    if not url or not detect_platform(url):
+        return jsonify({"error":"URL tidak valid atau platform tidak didukung."}), 400
+
+    progress_store[session_id] = {"percent":0,"status":"Mempersiapkan..."}
+
+    def hook(d):
+        if d["status"]=="downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            dl    = d.get("downloaded_bytes",0)
+            pct   = int(dl/total*100) if total>0 else 0
+            spd   = d.get("speed")
+            ss    = f"{spd/1024/1024:.1f} MB/s" if spd else ""
+            progress_store[session_id]={"percent":min(pct,95),"status":f"Downloading... {ss}".strip()}
+        elif d["status"]=="finished":
+            progress_store[session_id]={"percent":98,"status":"Memproses file..."}
+
+    is_audio = fmt=="mp3"
+    safe_sid = re.sub(r'[^a-zA-Z0-9_-]','',session_id)
+
+    # ── UCShare: gunakan custom downloader ──
+    if is_ucshare(url):
+        try:
+            out_file = DOWNLOAD_DIR / f"{safe_sid}_ucshare.mp4"
+            progress_store[session_id] = {"percent":0,"status":"Menghubungi UCShare..."}
+            info = ucshare_download(str(url), str(out_file), hook_fn=hook)
+
+            if not out_file.exists():
+                return jsonify({"error":"File UCShare tidak ditemukan setelah download."}), 500
+
+            progress_store[session_id] = {"percent":100,"status":"✓ Selesai!"}
+            title   = re.sub(r'[^\w\s\-.]','', info.get("title","ucshare_video")).strip()[:60] or "ucshare_video"
+            dl_name = f"{title}.mp4"
+
+            if save_zip:
+                batch_store[session_id] = {"path":str(out_file),"name":dl_name}
+
+            response = send_file(str(out_file), as_attachment=True,
+                                 download_name=dl_name, mimetype="video/mp4")
+            @response.call_on_close
+            def _uc_cleanup():
+                try:
+                    if session_id not in batch_store:
+                        out_file.unlink(missing_ok=True)
+                    progress_store.pop(session_id,None)
+                except: pass
+            return response
+
+        except Exception as e:
+            progress_store.pop(session_id,None)
+            return jsonify({"error":f"UCShare download gagal: {str(e)[:180]}"}), 400
+
+    out_tmpl = str(DOWNLOAD_DIR / f"{safe_sid}_%(title)s.%(ext)s")
+
+    opts = base_ydl_opts(hook)
+    opts["outtmpl"] = out_tmpl
+    opts["format"]  = get_format_selector(fmt)
+
+    if is_audio:
+        opts["postprocessors"] = [{"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":"192"}]
+    else:
+        opts["merge_output_format"] = "mp4"
+        opts["postprocessors"]      = [{"key":"FFmpegVideoConvertor","preferedformat":"mp4"}]
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info     = ydl.extract_info(url, download=True)
+            prepared = ydl.prepare_filename(info)
+
+        ext       = "mp3" if is_audio else "mp4"
+        candidate = Path(prepared).with_suffix(f".{ext}")
+        if not candidate.exists():
+            matches = list(DOWNLOAD_DIR.glob(f"{safe_sid}_*.{ext}"))
+            if not matches: matches = list(DOWNLOAD_DIR.glob(f"{safe_sid}_*"))
+            if matches: candidate = matches[0]
+            else: return jsonify({"error":"File tidak ditemukan setelah download."}), 500
+
+        progress_store[session_id] = {"percent":100,"status":"✓ Selesai!"}
+        title    = safe_fname(info)
+        dl_name  = f"{title}.{ext}"
+        mime     = "audio/mpeg" if is_audio else "video/mp4"
+
+        # Register file for batch zip usage
+        if save_zip:
+            batch_store[session_id] = {"path": str(candidate), "name": dl_name}
+
+        response = send_file(str(candidate), as_attachment=True,
+                             download_name=dl_name, mimetype=mime)
+
+        @response.call_on_close
+        def _cleanup():
+            try:
+                # Only delete if not reserved for zip
+                if session_id not in batch_store:
+                    candidate.unlink(missing_ok=True)
+                progress_store.pop(session_id, None)
+            except: pass
+
+        return response
+
+    except yt_dlp.utils.DownloadError as e:
+        progress_store.pop(session_id, None)
+        msg = str(e).lower()
+        if "private"   in msg: err="Konten bersifat private."
+        elif "unavailable" in msg: err="Konten tidak tersedia."
+        else: err="Download gagal. Coba lagi."
+        return jsonify({"error":err}), 400
+    except Exception as e:
+        progress_store.pop(session_id, None)
+        return jsonify({"error":f"Error: {str(e)[:120]}"}), 500
+
+
+@app.route("/api/progress/<session_id>")
+def api_progress(session_id):
+    return jsonify(progress_store.get(session_id,{"percent":0,"status":"Mempersiapkan..."}))
+
+
+# ─────────────────────────────────────────────────────────────
+#  BATCH ZIP ENDPOINT
+# ─────────────────────────────────────────────────────────────
+@app.route("/api/batch_zip", methods=["POST"])
+def api_batch_zip():
+    data     = request.get_json() or {}
+    file_ids = data.get("file_ids", [])
+
+    files = []
+    for fid in file_ids:
+        entry = batch_store.get(fid)
+        if entry and Path(entry["path"]).exists():
+            files.append(entry)
+
+    if not files:
+        return jsonify({"error":"Tidak ada file yang tersedia untuk di-ZIP."}), 400
+
+    zip_id   = str(uuid.uuid4())[:8]
+    zip_path = DOWNLOAD_DIR / f"vortexdl_batch_{zip_id}.zip"
+
+    try:
+        with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as zf:
+            for entry in files:
+                zf.write(entry["path"], entry["name"])
+
+        response = send_file(str(zip_path), as_attachment=True,
+                             download_name=f"VortexDL_Batch_{zip_id}.zip",
+                             mimetype="application/zip")
+
+        @response.call_on_close
+        def _cleanup_zip():
+            try:
+                zip_path.unlink(missing_ok=True)
+                for entry in files:
+                    try: Path(entry["path"]).unlink(missing_ok=True)
+                    except: pass
+                    batch_store.pop([k for k,v in batch_store.items() if v==entry][0], None)
+            except: pass
+
+        return response
+
+    except Exception as e:
+        return jsonify({"error":f"Gagal membuat ZIP: {str(e)[:100]}"}), 500
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    print("\n" + "="*56)
+    print("  ⚡  VortexDL v4.0 — Single & Batch Downloader")
+    print("="*56)
+    print("  ✔  Mode      : Single + Batch (antrian otomatis)")
+    print("  ✔  Platform  : YouTube, TikTok, Instagram, UCShare, +16 lagi")
+    print("  ✔  Batch     : Maks 20 link · ZIP semua hasil")
+    print("  ✔  Format    : 360p · 720p · 1080p · MP3")
+    print(f"  ✔  Folder    : {DOWNLOAD_DIR.resolve()}")
+    print("\n  ▶  Buka browser:  http://localhost:8080")
+    print("="*56 + "\n")
+    port = int(os.environ.get("PORT", 8080))
+    app.run(debug=False, host="0.0.0.0", port=port)
