@@ -1,13 +1,9 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
 import yt_dlp
 import requests
-import json
 import re
 import os
 import tempfile
-import threading
-import time
-from urllib.parse import urlparse
 
 app = Flask(__name__)
 
@@ -28,26 +24,92 @@ def detect_platform(url: str) -> str:
     return "unknown"
 
 # ─────────────────────────────────────────
-#  YT-DLP HELPERS
+#  USER-AGENTS
 # ─────────────────────────────────────────
-def get_ydl_opts_info(platform: str) -> dict:
-    base = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": False,
-        "skip_download": True,
-        "socket_timeout": 30,
+UA_CHROME = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+UA_ANDROID_TT = (
+    "com.zhiliaoapp.musically/2022600030 "
+    "(Linux; U; Android 13; en_US; Pixel 7; "
+    "Build/TQ3A.230901.001; Cronet/58.0.2991.0)"
+)
+UA_IPHONE = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.0 Mobile/15E148 Safari/604.1"
+)
+
+# ─────────────────────────────────────────
+#  PER-PLATFORM YT-DLP OPTIONS
+# ─────────────────────────────────────────
+def build_opts(platform: str, skip_download: bool = True) -> dict:
+    opts = {
+        "quiet":              True,
+        "no_warnings":        True,
+        "skip_download":      skip_download,
+        "socket_timeout":     30,
+        "nocheckcertificate": True,
+        "geo_bypass":         True,
+        "age_limit":          99,
+        "extractor_args":     {},
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent":      UA_CHROME,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
         },
     }
-    if platform == "tiktok":
-        base["extractor_args"] = {"tiktok": {"api_hostname": "api22-normal-c-useast2a.tiktokv.com"}}
-    return base
 
+    if platform == "youtube":
+        # Android client bypasses most sign-in prompts and age gates
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["android", "web"],
+                "player_skip":   ["webpage", "config"],
+            }
+        }
 
+    elif platform == "tiktok":
+        opts["http_headers"]["User-Agent"] = UA_ANDROID_TT
+        opts["extractor_args"] = {
+            "tiktok": {
+                "api_hostname": "api22-normal-c-useast2a.tiktokv.com",
+                "app_version":  "26.1.3",
+            }
+        }
+
+    elif platform == "instagram":
+        opts["http_headers"] = {
+            "User-Agent":      UA_IPHONE,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer":         "https://www.instagram.com/",
+        }
+        opts["extractor_args"] = {
+            "instagram": {"include_feed_data": ["0"]}
+        }
+
+    elif platform == "facebook":
+        opts["http_headers"] = {
+            "User-Agent":      UA_CHROME,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer":         "https://www.facebook.com/",
+            "sec-fetch-site":  "same-origin",
+        }
+
+    elif platform == "twitter":
+        opts["http_headers"] = {
+            "User-Agent":      UA_CHROME,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer":         "https://twitter.com/",
+        }
+
+    return opts
+
+# ─────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────
 def format_duration(seconds) -> str:
     if not seconds:
         return "N/A"
@@ -73,40 +135,69 @@ def format_filesize(size) -> str:
         return "N/A"
 
 
-def parse_formats(info: dict, platform: str) -> list:
+def parse_formats(info: dict) -> list:
     formats = info.get("formats", [])
-    result = []
-    seen = set()
+    result, seen = [], set()
 
     for f in formats:
         vcodec = f.get("vcodec", "none")
-        acodec = f.get("acodec", "none")
         if vcodec in (None, "none"):
             continue
-
         height = f.get("height") or 0
-        ext    = f.get("ext", "mp4")
         fid    = f.get("format_id", "")
         size   = f.get("filesize") or f.get("filesize_approx")
-        tbr    = f.get("tbr") or 0
-
-        label = f"{height}p" if height else fid
+        acodec = f.get("acodec", "none")
+        label  = f"{height}p" if height else fid
         if label in seen:
             continue
         seen.add(label)
-
         result.append({
             "format_id": fid,
             "label":     label,
-            "ext":       ext,
+            "ext":       f.get("ext", "mp4"),
             "height":    height,
             "filesize":  format_filesize(size),
-            "tbr":       tbr,
             "has_audio": acodec not in (None, "none"),
         })
 
     result.sort(key=lambda x: x["height"], reverse=True)
-    return result[:8] if result else [{"format_id": "best", "label": "Best", "ext": "mp4", "height": 0, "filesize": "N/A", "tbr": 0, "has_audio": True}]
+    if not result:
+        return [{"format_id": "best", "label": "Best Quality",
+                 "ext": "mp4", "height": 0, "filesize": "N/A", "has_audio": True}]
+    return result[:8]
+
+
+def classify_error(raw: str) -> str:
+    """Convert raw yt-dlp error to friendly Bahasa Indonesia message."""
+    m = raw.lower()
+
+    if any(k in m for k in ["sign in", "login", "log in", "private",
+                              "not available", "members only",
+                              "this video is private", "who can watch"]):
+        return (
+            "Video bersifat privat atau memerlukan login. "
+            "Pastikan video bisa dibuka tanpa akun, lalu coba lagi."
+        )
+    if any(k in m for k in ["not available in your country", "geo", "blocked in"]):
+        return "Video dibatasi secara geografis dan tidak dapat diakses dari server ini."
+    if any(k in m for k in ["age", "18+", "adult content", "age-restricted"]):
+        return "Video memiliki batasan usia (18+) dan memerlukan akun terverifikasi."
+    if any(k in m for k in ["copyright", "removed", "deleted", "terminated",
+                              "no longer available", "unavailable"]):
+        return "Video telah dihapus, dikenai copyright, atau tidak tersedia lagi."
+    if "unsupported url" in m:
+        return (
+            "URL tidak dikenali. Pastikan link mengarah langsung ke video, "
+            "bukan ke profil atau beranda platform."
+        )
+    if any(k in m for k in ["429", "too many requests", "rate limit"]):
+        return "Terlalu banyak permintaan ke platform. Tunggu 1–2 menit lalu coba lagi."
+    if "404" in m:
+        return "Video tidak ditemukan (404). Mungkin sudah dihapus atau link salah."
+    if "403" in m:
+        return "Akses ditolak platform (403). Video mungkin memerlukan autentikasi."
+
+    return f"Gagal mengambil video: {raw[:220].strip()}"
 
 
 # ─────────────────────────────────────────
@@ -119,52 +210,50 @@ def index():
 
 @app.route("/api/info", methods=["POST"])
 def api_info():
-    data = request.get_json(silent=True) or {}
-    url  = (data.get("url") or "").strip()
+    data     = request.get_json(silent=True) or {}
+    url      = (data.get("url") or "").strip()
 
     if not url:
         return jsonify({"error": "URL tidak boleh kosong"}), 400
 
     platform = detect_platform(url)
     if platform == "unknown":
-        return jsonify({"error": "Platform tidak didukung. Gunakan YouTube, TikTok, Instagram, Facebook, atau Twitter/X."}), 400
+        return jsonify({
+            "error": (
+                "Platform tidak didukung. "
+                "Gunakan link dari YouTube, TikTok, Instagram, Facebook, atau Twitter/X."
+            )
+        }), 400
 
     try:
-        opts = get_ydl_opts_info(platform)
+        opts = build_opts(platform, skip_download=True)
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
         if not info:
             return jsonify({"error": "Tidak dapat mengambil informasi video"}), 400
 
-        thumbnails = info.get("thumbnails", [])
+        thumbnails = info.get("thumbnails") or []
         thumb = ""
         if thumbnails:
-            best = max(thumbnails, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
+            best  = max(thumbnails, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
             thumb = best.get("url", "")
         if not thumb:
             thumb = info.get("thumbnail", "")
 
-        formats = parse_formats(info, platform)
-
         return jsonify({
-            "title":      info.get("title", "Video"),
-            "duration":   format_duration(info.get("duration")),
-            "thumbnail":  thumb,
-            "uploader":   info.get("uploader") or info.get("channel") or "",
-            "view_count": info.get("view_count"),
-            "platform":   platform,
-            "formats":    formats,
+            "title":        info.get("title", "Video"),
+            "duration":     format_duration(info.get("duration")),
+            "thumbnail":    thumb,
+            "uploader":     info.get("uploader") or info.get("channel") or "",
+            "view_count":   info.get("view_count"),
+            "platform":     platform,
+            "formats":      parse_formats(info),
             "original_url": url,
         })
 
     except yt_dlp.utils.DownloadError as e:
-        msg = str(e)
-        if "Sign in" in msg or "login" in msg.lower():
-            return jsonify({"error": "Video memerlukan login / bersifat privat"}), 400
-        if "Unsupported URL" in msg:
-            return jsonify({"error": "URL tidak didukung oleh yt-dlp"}), 400
-        return jsonify({"error": f"Gagal mengambil info: {msg[:200]}"}), 400
+        return jsonify({"error": classify_error(str(e))}), 400
     except Exception as e:
         return jsonify({"error": f"Error tidak terduga: {str(e)[:200]}"}), 500
 
@@ -173,84 +262,69 @@ def api_info():
 def download():
     data      = request.get_json(silent=True) or {}
     url       = (data.get("url") or "").strip()
-    format_id = (data.get("format_id") or "bestvideo+bestaudio/best").strip()
+    format_id = (data.get("format_id") or "best").strip()
     platform  = detect_platform(url)
 
     if not url:
         return jsonify({"error": "URL tidak boleh kosong"}), 400
 
-    # Build format string
-    if format_id and format_id not in ("best", "bestvideo+bestaudio/best"):
-        # Try to merge with best audio if format has no audio
-        fmt_str = f"{format_id}+bestaudio/bestvideo+bestaudio/best"
+    if format_id and format_id != "best":
+        fmt_str = f"{format_id}+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
     else:
-        fmt_str = "bestvideo+bestaudio/best"
+        fmt_str = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
 
     tmp_dir = tempfile.mkdtemp()
 
     try:
-        opts = {
-            "format":        fmt_str,
-            "outtmpl":       os.path.join(tmp_dir, "%(title).80s.%(ext)s"),
-            "quiet":         True,
-            "no_warnings":   True,
+        opts = build_opts(platform, skip_download=False)
+        opts.update({
+            "format":              fmt_str,
+            "outtmpl":             os.path.join(tmp_dir, "%(title).80s.%(ext)s"),
+            "socket_timeout":      60,
             "merge_output_format": "mp4",
-            "socket_timeout": 60,
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                              "Chrome/120.0.0.0 Safari/537.36"
-            },
             "postprocessors": [{
-                "key": "FFmpegVideoConvertor",
+                "key":            "FFmpegVideoConvertor",
                 "preferedformat": "mp4",
             }],
-        }
-
-        if platform == "tiktok":
-            opts["extractor_args"] = {"tiktok": {"api_hostname": "api22-normal-c-useast2a.tiktokv.com"}}
+        })
 
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info      = ydl.extract_info(url, download=True)
-            filename  = ydl.prepare_filename(info)
+            info     = ydl.extract_info(url, download=True)
+            prepared = ydl.prepare_filename(info)
 
-        # Find the actual file (might have different extension after merge)
+        # Find output file
         actual_file = None
-        for f in os.listdir(tmp_dir):
-            fpath = os.path.join(tmp_dir, f)
+        for fname in os.listdir(tmp_dir):
+            fpath = os.path.join(tmp_dir, fname)
             if os.path.isfile(fpath):
                 actual_file = fpath
                 break
 
-        if not actual_file or not os.path.exists(actual_file):
-            # fallback: use prepared filename
-            base = os.path.splitext(filename)[0]
-            for ext in [".mp4", ".mkv", ".webm", ".mov"]:
-                candidate = base + ext
-                if os.path.exists(candidate):
-                    actual_file = candidate
+        if not actual_file:
+            base = os.path.splitext(prepared)[0]
+            for ext in (".mp4", ".mkv", ".webm", ".mov"):
+                if os.path.exists(base + ext):
+                    actual_file = base + ext
                     break
 
         if not actual_file or not os.path.exists(actual_file):
-            return jsonify({"error": "File download gagal – tidak ditemukan di tmp"}), 500
+            return jsonify({"error": "File hasil download tidak ditemukan di server"}), 500
 
-        video_title = info.get("title", "video")
-        safe_title  = re.sub(r'[^\w\s\-]', '', video_title)[:80].strip() or "video"
-        dl_name     = f"{safe_title}.mp4"
+        safe_title = re.sub(r'[^\w\s\-]', '', info.get("title", "video"))[:80].strip() or "video"
+        dl_name    = f"{safe_title}.mp4"
+        filesize   = os.path.getsize(actual_file)
 
         def generate():
             with open(actual_file, "rb") as fh:
-                while chunk := fh.read(1024 * 512):  # 512 KB chunks
+                while chunk := fh.read(512 * 1024):
                     yield chunk
-            # Cleanup after streaming
             try:
                 os.remove(actual_file)
                 os.rmdir(tmp_dir)
             except Exception:
                 pass
 
-        filesize = os.path.getsize(actual_file)
-        resp = Response(
+        return Response(
             stream_with_context(generate()),
             mimetype="video/mp4",
             headers={
@@ -259,708 +333,487 @@ def download():
                 "X-Video-Title":       safe_title,
             },
         )
-        return resp
 
     except yt_dlp.utils.DownloadError as e:
-        return jsonify({"error": f"Download error: {str(e)[:300]}"}), 400
+        return jsonify({"error": classify_error(str(e))}), 400
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)[:300]}"}), 500
 
 
 # ─────────────────────────────────────────
-#  HTML FRONTEND (single-file embedded)
+#  FRONTEND
 # ─────────────────────────────────────────
-HTML_PAGE = """<!DOCTYPE html>
+HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="id">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>VortexDL — Video Downloader</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;1,9..40,300&display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500&display=swap" rel="stylesheet"/>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-
 :root{
-  --bg0:#05060a;
-  --bg1:#0c0d14;
-  --bg2:#121420;
-  --bg3:#1a1d2e;
-  --glass:rgba(255,255,255,0.04);
-  --glass-border:rgba(255,255,255,0.08);
-  --accent:#7c6aff;
-  --accent2:#ff6ac1;
-  --accent3:#6affdb;
-  --text:#eeeef4;
-  --text-dim:#888ca8;
-  --text-muted:#444660;
-  --success:#22d87a;
-  --error:#ff4f6a;
-  --warn:#ffb347;
-  --radius:16px;
-  --radius-sm:10px;
-  --transition:.25s cubic-bezier(.4,0,.2,1);
+  --bg0:#05060a;--bg1:#0c0d14;--bg2:#121420;--bg3:#1a1d2e;
+  --glass:rgba(255,255,255,0.04);--glass-b:rgba(255,255,255,0.08);
+  --accent:#7c6aff;--accent2:#ff6ac1;--accent3:#6affdb;
+  --text:#eeeef4;--dim:#888ca8;--muted:#444660;
+  --ok:#22d87a;--err:#ff4f6a;
+  --r:16px;--rs:10px;--tr:.25s cubic-bezier(.4,0,.2,1);
 }
-
 html{scroll-behavior:smooth}
-body{
-  font-family:'DM Sans',sans-serif;
-  background:var(--bg0);
-  color:var(--text);
-  min-height:100vh;
-  overflow-x:hidden;
-}
-
-/* ── NOISE TEXTURE OVERLAY ── */
-body::before{
-  content:'';
-  position:fixed;inset:0;
-  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
-  pointer-events:none;z-index:0;opacity:.5;
-}
-
-/* ── ANIMATED BG BLOBS ── */
-.blob{
-  position:fixed;border-radius:50%;filter:blur(120px);
-  pointer-events:none;z-index:0;animation:drift 18s ease-in-out infinite;
-}
-.blob-1{width:600px;height:600px;background:radial-gradient(circle,rgba(124,106,255,.18),transparent 70%);top:-200px;left:-200px;animation-delay:0s}
-.blob-2{width:500px;height:500px;background:radial-gradient(circle,rgba(255,106,193,.14),transparent 70%);top:40%;right:-150px;animation-delay:-6s}
-.blob-3{width:400px;height:400px;background:radial-gradient(circle,rgba(106,255,219,.1),transparent 70%);bottom:-100px;left:30%;animation-delay:-12s}
-@keyframes drift{0%,100%{transform:translate(0,0) scale(1)}33%{transform:translate(40px,-30px) scale(1.05)}66%{transform:translate(-20px,50px) scale(.97)}}
-
-/* ── LAYOUT ── */
-.wrap{
-  position:relative;z-index:1;
-  max-width:760px;margin:0 auto;
-  padding:40px 20px 80px;
-}
-
-/* ── HEADER ── */
-header{text-align:center;margin-bottom:56px;padding-top:16px}
-.logo{
-  font-family:'Syne',sans-serif;font-weight:800;font-size:clamp(2.4rem,6vw,3.6rem);
-  background:linear-gradient(135deg,var(--accent) 0%,var(--accent2) 50%,var(--accent3) 100%);
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
-  letter-spacing:-.03em;line-height:1;
-}
-.logo span{-webkit-text-fill-color:var(--text-dim);font-weight:400;font-size:.45em;letter-spacing:.05em}
-.tagline{margin-top:12px;color:var(--text-dim);font-size:.95rem;font-weight:300;letter-spacing:.02em}
-
-/* ── PLATFORM BADGES ── */
-.platforms{
-  display:flex;justify-content:center;flex-wrap:wrap;gap:10px;margin-top:20px;
-}
-.badge{
-  display:flex;align-items:center;gap:6px;
-  padding:5px 12px;border-radius:100px;
-  background:var(--glass);border:1px solid var(--glass-border);
-  font-size:.78rem;font-weight:500;color:var(--text-dim);
-  transition:var(--transition);
-}
+body{font-family:'DM Sans',sans-serif;background:var(--bg0);color:var(--text);min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");pointer-events:none;z-index:0}
+.blob{position:fixed;border-radius:50%;filter:blur(110px);pointer-events:none;z-index:0;animation:drift 18s ease-in-out infinite}
+.b1{width:550px;height:550px;background:radial-gradient(circle,rgba(124,106,255,.2),transparent 70%);top:-180px;left:-180px}
+.b2{width:450px;height:450px;background:radial-gradient(circle,rgba(255,106,193,.15),transparent 70%);top:40%;right:-130px;animation-delay:-6s}
+.b3{width:380px;height:380px;background:radial-gradient(circle,rgba(106,255,219,.11),transparent 70%);bottom:-80px;left:28%;animation-delay:-12s}
+@keyframes drift{0%,100%{transform:translate(0,0)}33%{transform:translate(35px,-25px)}66%{transform:translate(-18px,45px)}}
+.wrap{position:relative;z-index:1;max-width:740px;margin:0 auto;padding:36px 20px 80px}
+/* Header */
+header{text-align:center;margin-bottom:44px;padding-top:12px}
+.logo{font-family:'Syne',sans-serif;font-weight:800;font-size:clamp(2rem,6vw,3.2rem);background:linear-gradient(135deg,var(--accent) 0%,var(--accent2) 50%,var(--accent3) 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;letter-spacing:-.03em}
+.logo em{-webkit-text-fill-color:var(--dim);font-style:normal;font-weight:400;font-size:.44em;letter-spacing:.05em}
+.tagline{margin-top:9px;color:var(--dim);font-size:.91rem;font-weight:300}
+.platforms{display:flex;justify-content:center;flex-wrap:wrap;gap:8px;margin-top:16px}
+.badge{display:flex;align-items:center;gap:5px;padding:4px 11px;border-radius:100px;background:var(--glass);border:1px solid var(--glass-b);font-size:.74rem;font-weight:500;color:var(--dim);transition:var(--tr)}
 .badge:hover{border-color:var(--accent);color:var(--accent)}
-.badge .dot{width:7px;height:7px;border-radius:50%}
-
-/* ── CARD ── */
-.card{
-  background:var(--glass);
-  border:1px solid var(--glass-border);
-  border-radius:var(--radius);
-  padding:32px;
-  backdrop-filter:blur(24px);
-  -webkit-backdrop-filter:blur(24px);
-  transition:border-color var(--transition);
-}
-.card:focus-within{border-color:rgba(124,106,255,.35)}
-
-/* ── INPUT GROUP ── */
-.input-group{display:flex;gap:12px;flex-wrap:wrap}
-.url-input{
-  flex:1;min-width:220px;
-  background:rgba(255,255,255,.05);
-  border:1.5px solid var(--glass-border);
-  border-radius:var(--radius-sm);
-  color:var(--text);
-  font-family:'DM Sans',sans-serif;
-  font-size:.95rem;
-  padding:14px 18px;
-  outline:none;
-  transition:border-color var(--transition),box-shadow var(--transition);
-}
-.url-input::placeholder{color:var(--text-muted)}
-.url-input:focus{
-  border-color:var(--accent);
-  box-shadow:0 0 0 3px rgba(124,106,255,.15);
-}
-
-.btn{
-  display:inline-flex;align-items:center;justify-content:center;gap:8px;
-  font-family:'DM Sans',sans-serif;font-weight:500;font-size:.92rem;
-  border:none;cursor:pointer;border-radius:var(--radius-sm);
-  padding:14px 22px;transition:var(--transition);white-space:nowrap;
-}
-.btn-primary{
-  background:linear-gradient(135deg,var(--accent),#9e6aff);
-  color:#fff;
-  box-shadow:0 4px 24px rgba(124,106,255,.35);
-}
-.btn-primary:hover{transform:translateY(-1px);box-shadow:0 6px 32px rgba(124,106,255,.5)}
-.btn-primary:active{transform:translateY(0)}
-.btn-primary:disabled{opacity:.5;cursor:not-allowed;transform:none}
-.btn-success{
-  background:linear-gradient(135deg,#22d87a,#1aad62);
-  color:#fff;width:100%;
-  box-shadow:0 4px 24px rgba(34,216,122,.25);
-  font-size:1rem;font-weight:600;padding:16px;
-}
-.btn-success:hover{transform:translateY(-1px);box-shadow:0 6px 32px rgba(34,216,122,.4)}
-.btn-success:active{transform:translateY(0)}
-.btn-success:disabled{opacity:.5;cursor:not-allowed;transform:none}
-.btn-ghost{
-  background:var(--glass);border:1px solid var(--glass-border);
-  color:var(--text-dim);font-size:.82rem;padding:8px 14px;
-}
-.btn-ghost:hover{border-color:var(--accent3);color:var(--accent3)}
-
-/* ── SPINNER ── */
+.dot{width:6px;height:6px;border-radius:50%}
+/* Card */
+.card{background:var(--glass);border:1px solid var(--glass-b);border-radius:var(--r);padding:26px;backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);transition:border-color var(--tr)}
+.card:focus-within{border-color:rgba(124,106,255,.3)}
+/* Input */
+.input-row{display:flex;gap:10px;flex-wrap:wrap}
+.url-in{flex:1;min-width:190px;background:rgba(255,255,255,.05);border:1.5px solid var(--glass-b);border-radius:var(--rs);color:var(--text);font-family:'DM Sans',sans-serif;font-size:.93rem;padding:12px 15px;outline:none;transition:border-color var(--tr),box-shadow var(--tr)}
+.url-in::placeholder{color:var(--muted)}
+.url-in:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,106,255,.13)}
+/* Buttons */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;font-family:'DM Sans',sans-serif;font-weight:500;font-size:.88rem;border:none;cursor:pointer;border-radius:var(--rs);padding:12px 18px;transition:var(--tr);white-space:nowrap}
+.primary{background:linear-gradient(135deg,var(--accent),#9e6aff);color:#fff;box-shadow:0 4px 18px rgba(124,106,255,.33)}
+.primary:hover{transform:translateY(-1px);box-shadow:0 6px 26px rgba(124,106,255,.48)}
+.primary:active,.primary:disabled{transform:none;opacity:.55;cursor:not-allowed}
+.success{background:linear-gradient(135deg,var(--ok),#1aad62);color:#fff;width:100%;box-shadow:0 4px 18px rgba(34,216,122,.22);font-size:.95rem;font-weight:600;padding:14px}
+.success:hover{transform:translateY(-1px);box-shadow:0 6px 26px rgba(34,216,122,.38)}
+.success:active,.success:disabled{transform:none;opacity:.55;cursor:not-allowed}
+.ghost{background:var(--glass);border:1px solid var(--glass-b);color:var(--dim);font-size:.78rem;padding:6px 11px}
+.ghost:hover{border-color:var(--accent3);color:var(--accent3)}
 @keyframes spin{to{transform:rotate(360deg)}}
-.spinner{
-  width:18px;height:18px;border-radius:50%;
-  border:2.5px solid rgba(255,255,255,.2);
-  border-top-color:#fff;
-  animation:spin .7s linear infinite;display:inline-block;flex-shrink:0;
-}
-
-/* ── PLATFORM INDICATOR ── */
-.platform-indicator{
-  display:none;align-items:center;gap:8px;
-  margin-top:14px;font-size:.82rem;
-  color:var(--accent3);font-weight:500;
-}
-.platform-indicator.show{display:flex}
-.pi-icon{font-size:1.1em}
-
-/* ── DIVIDER ── */
-.divider{height:1px;background:var(--glass-border);margin:28px 0}
-
-/* ── VIDEO INFO ── */
-#info-section{display:none;margin-top:28px}
-#info-section.show{display:block;animation:slideUp .4s cubic-bezier(.4,0,.2,1) both}
-@keyframes slideUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
-
-.video-meta{
-  display:grid;grid-template-columns:auto 1fr;gap:18px;
-  background:rgba(255,255,255,.03);
-  border:1px solid var(--glass-border);
-  border-radius:var(--radius-sm);
-  overflow:hidden;
-}
-.thumb-wrap{
-  position:relative;width:160px;
-  cursor:pointer;overflow:hidden;flex-shrink:0;
-}
-.thumb-wrap img{
-  width:100%;height:100%;object-fit:cover;
-  display:block;transition:transform .4s ease;
-}
-.thumb-wrap:hover img{transform:scale(1.05)}
-.play-overlay{
-  position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
-  background:rgba(0,0,0,.4);opacity:0;transition:opacity var(--transition);
-}
-.thumb-wrap:hover .play-overlay{opacity:1}
-.play-icon{
-  width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.9);
-  display:flex;align-items:center;justify-content:center;
-}
-.play-icon svg{fill:var(--bg0);margin-left:3px}
-
-.meta-body{padding:18px 18px 18px 0;display:flex;flex-direction:column;gap:8px;min-width:0}
-.meta-title{
-  font-family:'Syne',sans-serif;font-weight:600;font-size:1rem;
-  line-height:1.4;overflow:hidden;display:-webkit-box;
-  -webkit-line-clamp:2;-webkit-box-orient:vertical;
-}
-.meta-row{display:flex;flex-wrap:wrap;gap:12px;margin-top:auto}
-.meta-chip{
-  display:flex;align-items:center;gap:5px;
-  font-size:.78rem;color:var(--text-dim);
-  background:rgba(255,255,255,.05);
-  padding:4px 10px;border-radius:100px;
-}
-.meta-chip svg{opacity:.7}
-
-/* ── FORMAT SELECT ── */
-.format-section{margin-top:20px}
-.format-label{font-size:.82rem;color:var(--text-dim);font-weight:500;margin-bottom:10px}
-.format-grid{display:flex;flex-wrap:wrap;gap:8px}
-.fmt-btn{
-  background:rgba(255,255,255,.05);
-  border:1.5px solid var(--glass-border);
-  border-radius:8px;color:var(--text-dim);
-  font-family:'DM Sans',sans-serif;font-size:.8rem;
-  padding:7px 14px;cursor:pointer;
-  transition:var(--transition);
-}
-.fmt-btn:hover{border-color:var(--accent);color:var(--accent)}
-.fmt-btn.active{
-  background:rgba(124,106,255,.15);
-  border-color:var(--accent);color:var(--accent);
-  font-weight:600;
-}
-
-/* ── DOWNLOAD BTN AREA ── */
-.dl-area{margin-top:22px}
-.progress-bar-wrap{
-  height:4px;background:rgba(255,255,255,.08);
-  border-radius:100px;overflow:hidden;margin-bottom:16px;display:none;
-}
-.progress-bar-fill{
-  height:100%;background:linear-gradient(90deg,var(--accent),var(--accent3));
-  border-radius:100px;width:0%;
-  transition:width .3s ease;
-  animation:shimmer 1.5s infinite;
-}
-@keyframes shimmer{0%{filter:brightness(1)}50%{filter:brightness(1.3)}100%{filter:brightness(1)}}
-
-/* ── PREVIEW MODAL ── */
-.modal-overlay{
-  display:none;position:fixed;inset:0;z-index:100;
-  background:rgba(0,0,0,.85);backdrop-filter:blur(12px);
-  align-items:center;justify-content:center;padding:20px;
-}
-.modal-overlay.show{display:flex;animation:fadeIn .2s ease}
-@keyframes fadeIn{from{opacity:0}to{opacity:1}}
-.modal-inner{
-  max-width:720px;width:100%;
-  background:var(--bg2);border:1px solid var(--glass-border);
-  border-radius:var(--radius);overflow:hidden;
-  animation:popIn .3s cubic-bezier(.34,1.56,.64,1) both;
-}
-@keyframes popIn{from{opacity:0;transform:scale(.9)}to{opacity:1;transform:scale(1)}}
-.modal-header{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:16px 20px;border-bottom:1px solid var(--glass-border);
-}
-.modal-title{font-family:'Syne',sans-serif;font-weight:600;font-size:.95rem}
-.modal-close{
-  background:none;border:none;color:var(--text-dim);cursor:pointer;
-  font-size:1.4rem;line-height:1;transition:color var(--transition);
-}
-.modal-close:hover{color:var(--text)}
-#preview-video{width:100%;max-height:70vh;background:#000}
-
-/* ── HISTORY ── */
-#history-section{margin-top:48px;display:none}
-#history-section.show{display:block}
-.section-head{
-  display:flex;align-items:center;justify-content:space-between;
-  margin-bottom:16px;
-}
-.section-title{font-family:'Syne',sans-serif;font-weight:700;font-size:1.05rem}
-.history-list{display:flex;flex-direction:column;gap:10px}
-.history-item{
-  display:flex;align-items:center;gap:14px;
-  background:var(--glass);border:1px solid var(--glass-border);
-  border-radius:var(--radius-sm);padding:12px 14px;
-  transition:border-color var(--transition);
-}
-.history-item:hover{border-color:rgba(124,106,255,.25)}
-.h-thumb{
-  width:56px;height:38px;border-radius:6px;
-  object-fit:cover;flex-shrink:0;background:var(--bg3);
-}
-.h-title{flex:1;font-size:.85rem;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;color:var(--text)}
-.h-platform{font-size:.72rem;color:var(--text-dim);background:rgba(255,255,255,.06);padding:2px 8px;border-radius:100px;flex-shrink:0}
-.h-time{font-size:.72rem;color:var(--text-muted);flex-shrink:0}
-
-/* ── TOAST ── */
-.toast-wrap{position:fixed;bottom:24px;right:24px;z-index:999;display:flex;flex-direction:column;gap:10px}
-.toast{
-  padding:13px 18px;border-radius:var(--radius-sm);
-  font-size:.87rem;font-weight:500;max-width:320px;
-  display:flex;align-items:center;gap:10px;
-  box-shadow:0 8px 32px rgba(0,0,0,.5);
-  animation:toastIn .35s cubic-bezier(.34,1.56,.64,1) both;
-}
-@keyframes toastIn{from{opacity:0;transform:translateX(40px)}to{opacity:1;transform:translateX(0)}}
-.toast-success{background:#0d2b1e;border:1px solid #22d87a44;color:#22d87a}
-.toast-error{background:#2b0d14;border:1px solid #ff4f6a44;color:#ff4f6a}
-.toast-info{background:#151128;border:1px solid #7c6aff44;color:#a89aff}
-
-/* ── FOOTER ── */
-footer{text-align:center;color:var(--text-muted);font-size:.78rem;padding-top:48px}
-footer a{color:var(--text-dim);text-decoration:none}
-
-/* ── RESPONSIVE ── */
-@media(max-width:520px){
-  .wrap{padding:24px 16px 60px}
-  .card{padding:20px}
-  .video-meta{grid-template-columns:1fr}
-  .thumb-wrap{width:100%;height:180px}
-  .meta-body{padding:14px}
+.spin{width:16px;height:16px;border-radius:50%;border:2.5px solid rgba(255,255,255,.2);border-top-color:#fff;animation:spin .7s linear infinite;display:inline-block;flex-shrink:0}
+/* Platform tag */
+.ptag{display:none;align-items:center;gap:7px;margin-top:11px;font-size:.8rem;color:var(--accent3);font-weight:500}
+.ptag.on{display:flex}
+/* Error box */
+.ebox{background:rgba(255,79,106,.07);border:1px solid rgba(255,79,106,.22);border-radius:var(--rs);padding:14px 16px;margin-top:15px;display:none;animation:su .3s ease both}
+.ebox.on{display:block}
+.etitle{font-size:.79rem;font-weight:700;color:var(--err);margin-bottom:6px}
+.emsg{font-size:.83rem;color:#ffb3bf;line-height:1.55}
+.etips{margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,79,106,.15)}
+.etips b{font-size:.77rem;color:var(--dim)}
+.etips ul{padding-left:16px;font-size:.77rem;color:var(--dim);line-height:1.75;margin-top:4px}
+/* Divider */
+hr{border:none;border-top:1px solid var(--glass-b);margin:22px 0}
+/* Info section */
+#info{display:none;margin-top:20px}
+#info.on{display:block;animation:su .4s cubic-bezier(.4,0,.2,1) both}
+@keyframes su{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+/* Video meta */
+.vmeta{display:grid;grid-template-columns:148px 1fr;background:rgba(255,255,255,.03);border:1px solid var(--glass-b);border-radius:var(--rs);overflow:hidden}
+.tbox{position:relative;width:148px;min-height:108px;background:var(--bg3);cursor:pointer;overflow:hidden}
+.tbox img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .35s}
+.tbox:hover img{transform:scale(1.06)}
+.povr{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.42);opacity:0;transition:opacity var(--tr)}
+.tbox:hover .povr{opacity:1}
+.pico{width:40px;height:40px;border-radius:50%;background:rgba(255,255,255,.92);display:flex;align-items:center;justify-content:center}
+.mbody{padding:15px;display:flex;flex-direction:column;gap:7px;min-width:0}
+.mtitle{font-family:'Syne',sans-serif;font-weight:600;font-size:.95rem;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.mrow{display:flex;flex-wrap:wrap;gap:7px;margin-top:auto}
+.chip{display:flex;align-items:center;gap:4px;font-size:.73rem;color:var(--dim);background:rgba(255,255,255,.05);padding:3px 8px;border-radius:100px}
+/* Formats */
+.fsec{margin-top:16px}
+.flabel{font-size:.79rem;color:var(--dim);font-weight:500;margin-bottom:7px}
+.fgrid{display:flex;flex-wrap:wrap;gap:6px}
+.fbtn{background:rgba(255,255,255,.05);border:1.5px solid var(--glass-b);border-radius:7px;color:var(--dim);font-family:'DM Sans',sans-serif;font-size:.77rem;padding:5px 12px;cursor:pointer;transition:var(--tr)}
+.fbtn:hover{border-color:var(--accent);color:var(--accent)}
+.fbtn.sel{background:rgba(124,106,255,.14);border-color:var(--accent);color:var(--accent);font-weight:600}
+/* Download area */
+.dla{margin-top:18px}
+.pbar-wrap{height:3px;background:rgba(255,255,255,.07);border-radius:100px;overflow:hidden;margin-bottom:12px;display:none}
+.pbar{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent3));border-radius:100px;width:0;transition:width .3s}
+/* Modal */
+.movr{display:none;position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.86);backdrop-filter:blur(12px);align-items:center;justify-content:center;padding:20px}
+.movr.on{display:flex;animation:fi .2s ease}
+@keyframes fi{from{opacity:0}to{opacity:1}}
+.min{max-width:700px;width:100%;background:var(--bg2);border:1px solid var(--glass-b);border-radius:var(--r);overflow:hidden;animation:pi .28s cubic-bezier(.34,1.56,.64,1) both}
+@keyframes pi{from{opacity:0;transform:scale(.88)}to{opacity:1;transform:scale(1)}}
+.mhd{display:flex;align-items:center;justify-content:space-between;padding:13px 17px;border-bottom:1px solid var(--glass-b)}
+.mhd-t{font-family:'Syne',sans-serif;font-weight:600;font-size:.9rem}
+.mclose{background:none;border:none;color:var(--dim);cursor:pointer;font-size:1.25rem;line-height:1;transition:color var(--tr)}
+.mclose:hover{color:var(--text)}
+#pvideo{width:100%;max-height:68vh;background:#000}
+/* History */
+#hist{margin-top:42px;display:none}
+#hist.on{display:block}
+.shed{display:flex;align-items:center;justify-content:space-between;margin-bottom:13px}
+.shtitle{font-family:'Syne',sans-serif;font-weight:700;font-size:.98rem}
+.hlist{display:flex;flex-direction:column;gap:7px}
+.hi{display:flex;align-items:center;gap:11px;background:var(--glass);border:1px solid var(--glass-b);border-radius:var(--rs);padding:9px 11px;transition:border-color var(--tr)}
+.hi:hover{border-color:rgba(124,106,255,.22)}
+.hthumb{width:50px;height:34px;border-radius:5px;object-fit:cover;flex-shrink:0;background:var(--bg3)}
+.htitle{flex:1;font-size:.81rem;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.hplat{font-size:.69rem;color:var(--dim);background:rgba(255,255,255,.06);padding:2px 7px;border-radius:100px;flex-shrink:0}
+.htime{font-size:.69rem;color:var(--muted);flex-shrink:0}
+/* Toast */
+.toasts{position:fixed;bottom:22px;right:22px;z-index:999;display:flex;flex-direction:column;gap:8px}
+.toast{padding:11px 15px;border-radius:var(--rs);font-size:.83rem;font-weight:500;max-width:320px;display:flex;align-items:flex-start;gap:8px;box-shadow:0 8px 26px rgba(0,0,0,.5);animation:tin .3s cubic-bezier(.34,1.56,.64,1) both}
+@keyframes tin{from{opacity:0;transform:translateX(38px)}to{opacity:1;transform:translateX(0)}}
+.t-ok{background:#0d2b1e;border:1px solid #22d87a44;color:#22d87a}
+.t-err{background:#2b0d14;border:1px solid #ff4f6a44;color:#ff4f6a}
+.t-inf{background:#151128;border:1px solid #7c6aff44;color:#a89aff}
+footer{text-align:center;color:var(--muted);font-size:.74rem;padding-top:42px}
+footer a{color:var(--dim);text-decoration:none}
+@media(max-width:500px){
+  .wrap{padding:18px 13px 56px}
+  .card{padding:15px}
+  .vmeta{grid-template-columns:1fr}
+  .tbox{width:100%;height:165px}
+  .mbody{padding:12px}
 }
 </style>
 </head>
 <body>
-
-<!-- BLOBS -->
-<div class="blob blob-1"></div>
-<div class="blob blob-2"></div>
-<div class="blob blob-3"></div>
-
+<div class="blob b1"></div>
+<div class="blob b2"></div>
+<div class="blob b3"></div>
 <div class="wrap">
 
-  <!-- HEADER -->
-  <header>
-    <div class="logo">Vortex<span>DL</span></div>
-    <p class="tagline">Download video dari semua platform, cepat & tanpa batas</p>
-    <div class="platforms">
-      <div class="badge"><span class="dot" style="background:#ff0000"></span>YouTube</div>
-      <div class="badge"><span class="dot" style="background:#ff0050"></span>TikTok</div>
-      <div class="badge"><span class="dot" style="background:#e1306c"></span>Instagram</div>
-      <div class="badge"><span class="dot" style="background:#1877f2"></span>Facebook</div>
-      <div class="badge"><span class="dot" style="background:#1da1f2"></span>Twitter/X</div>
-    </div>
-  </header>
+<header>
+  <div class="logo">Vortex<em>DL</em></div>
+  <p class="tagline">Download video dari semua platform, cepat &amp; tanpa batas</p>
+  <div class="platforms">
+    <div class="badge"><span class="dot" style="background:#ff0000"></span>YouTube</div>
+    <div class="badge"><span class="dot" style="background:#ff0050"></span>TikTok</div>
+    <div class="badge"><span class="dot" style="background:#e1306c"></span>Instagram</div>
+    <div class="badge"><span class="dot" style="background:#1877f2"></span>Facebook</div>
+    <div class="badge"><span class="dot" style="background:#1da1f2"></span>Twitter/X</div>
+  </div>
+</header>
 
-  <!-- MAIN CARD -->
-  <div class="card">
-    <div class="input-group">
-      <input
-        id="url-input"
-        class="url-input"
-        type="url"
-        placeholder="Paste URL video di sini... (YouTube, TikTok, IG, FB, X)"
-        autocomplete="off"
-        spellcheck="false"
-      />
-      <button class="btn btn-primary" id="fetch-btn" onclick="fetchInfo()">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        Cari
+<div class="card">
+  <div class="input-row">
+    <input id="url-in" class="url-in" type="url"
+      placeholder="Paste URL video di sini… (YouTube, TikTok, IG, FB, X)"
+      autocomplete="off" spellcheck="false"/>
+    <button class="btn primary" id="fbtn" onclick="fetchInfo()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      Cari
+    </button>
+  </div>
+
+  <div class="ptag" id="ptag"><span>⚡</span><span id="pname">—</span></div>
+
+  <!-- Error box -->
+  <div class="ebox" id="ebox">
+    <div class="etitle">⚠️ Gagal Mengambil Video</div>
+    <div class="emsg" id="emsg"></div>
+    <div class="etips">
+      <b>💡 Tips untuk mengatasi:</b>
+      <ul id="etips-list"></ul>
+    </div>
+  </div>
+
+  <!-- Info section -->
+  <div id="info">
+    <hr/>
+    <div class="vmeta">
+      <div class="tbox" onclick="openPreview()">
+        <img id="thumb" src="" alt=""/>
+        <div class="povr"><div class="pico">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="#05060a"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        </div></div>
+      </div>
+      <div class="mbody">
+        <div class="mtitle" id="mtitle">—</div>
+        <div class="mrow">
+          <div class="chip" id="mdur"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg><span>—</span></div>
+          <div class="chip" id="mup"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg><span>—</span></div>
+          <div class="chip" id="mplat"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg><span>—</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="fsec">
+      <div class="flabel">Pilih kualitas:</div>
+      <div class="fgrid" id="fgrid"></div>
+    </div>
+
+    <div class="dla">
+      <div class="pbar-wrap" id="pwrap"><div class="pbar" id="pbar"></div></div>
+      <button class="btn success" id="dlbtn" onclick="startDownload()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Download Video (MP4)
       </button>
     </div>
-
-    <!-- Platform detected -->
-    <div class="platform-indicator" id="platform-tag">
-      <span class="pi-icon">⚡</span>
-      <span id="platform-name">—</span>
-    </div>
-
-    <!-- Video info section -->
-    <div id="info-section">
-      <div class="divider"></div>
-
-      <div class="video-meta" id="video-meta">
-        <div class="thumb-wrap" id="thumb-wrap" onclick="openPreview()">
-          <img id="thumb-img" src="" alt="Thumbnail"/>
-          <div class="play-overlay">
-            <div class="play-icon">
-              <svg width="16" height="16" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-            </div>
-          </div>
-        </div>
-        <div class="meta-body">
-          <div class="meta-title" id="meta-title">—</div>
-          <div class="meta-row">
-            <div class="meta-chip" id="meta-dur">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-              <span>—</span>
-            </div>
-            <div class="meta-chip" id="meta-uploader">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-              <span>—</span>
-            </div>
-            <div class="meta-chip" id="meta-platform">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-              <span>—</span>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Format chooser -->
-      <div class="format-section">
-        <div class="format-label">Pilih kualitas:</div>
-        <div class="format-grid" id="format-grid"></div>
-      </div>
-
-      <!-- Download -->
-      <div class="dl-area">
-        <div class="progress-bar-wrap" id="progress-wrap">
-          <div class="progress-bar-fill" id="progress-bar"></div>
-        </div>
-        <button class="btn btn-success" id="dl-btn" onclick="startDownload()">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-          Download Video (MP4)
-        </button>
-      </div>
-    </div>
-  </div>
-
-  <!-- HISTORY -->
-  <div id="history-section">
-    <div class="divider" style="margin-top:40px"></div>
-    <div class="section-head">
-      <div class="section-title">📋 Riwayat Download</div>
-      <button class="btn btn-ghost" onclick="clearHistory()">Hapus semua</button>
-    </div>
-    <div class="history-list" id="history-list"></div>
-  </div>
-
-  <footer>
-    <p>VortexDL &mdash; Untuk penggunaan pribadi. Hormati hak cipta konten. &nbsp;|&nbsp; Powered by <a href="https://github.com/yt-dlp/yt-dlp" target="_blank">yt-dlp</a></p>
-  </footer>
-</div>
-
-<!-- PREVIEW MODAL -->
-<div class="modal-overlay" id="modal" onclick="closePreview(event)">
-  <div class="modal-inner">
-    <div class="modal-header">
-      <span class="modal-title" id="modal-title">Preview Video</span>
-      <button class="modal-close" onclick="closePreviewDirect()">✕</button>
-    </div>
-    <video id="preview-video" controls playsinline></video>
   </div>
 </div>
 
-<!-- TOAST CONTAINER -->
-<div class="toast-wrap" id="toasts"></div>
+<!-- History -->
+<div id="hist">
+  <hr style="margin-top:36px"/>
+  <div class="shed">
+    <div class="shtitle">📋 Riwayat Download</div>
+    <button class="btn ghost" onclick="clearHist()">Hapus semua</button>
+  </div>
+  <div class="hlist" id="hlist"></div>
+</div>
+
+<footer>
+  VortexDL — Untuk penggunaan pribadi. Hormati hak cipta konten. |
+  Powered by <a href="https://github.com/yt-dlp/yt-dlp" target="_blank">yt-dlp</a>
+</footer>
+</div>
+
+<!-- Preview Modal -->
+<div class="movr" id="modal" onclick="closeModal(event)">
+  <div class="min">
+    <div class="mhd">
+      <span class="mhd-t" id="mtitle2">Preview</span>
+      <button class="mclose" onclick="closeModalDirect()">✕</button>
+    </div>
+    <video id="pvideo" controls playsinline></video>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
 
 <script>
-// ── STATE ──
-let currentInfo = null;
-let selectedFormat = null;
-let downloadHistory = JSON.parse(sessionStorage.getItem('vdl_history') || '[]');
+let info = null, selFmt = null;
+let hist = JSON.parse(sessionStorage.getItem('vdl_h') || '[]');
 
-// ── PLATFORM ICONS ──
-const P_ICON = {
-  youtube:   '▶️ YouTube',
-  tiktok:    '🎵 TikTok',
-  instagram: '📸 Instagram',
-  facebook:  '🔵 Facebook',
-  twitter:   '🐦 Twitter/X',
-  unknown:   '❓ Unknown',
+const PL = {
+  youtube:'▶ YouTube', tiktok:'♪ TikTok',
+  instagram:'◈ Instagram', facebook:'ƒ Facebook',
+  twitter:'✦ Twitter/X'
 };
 
-// ── TOAST ──
-function toast(msg, type='info', dur=4000){
-  const wrap = document.getElementById('toasts');
-  const el = document.createElement('div');
-  el.className = `toast toast-${type}`;
-  el.innerHTML = (type==='success'?'✅ ':type==='error'?'❌ ':'💬 ')+msg;
-  wrap.appendChild(el);
-  setTimeout(()=>{el.style.opacity='0';el.style.transform='translateX(40px)';el.style.transition='.4s ease';setTimeout(()=>el.remove(),400)},dur);
+const TIPS = {
+  login:   ['Pastikan video bersifat publik (bukan Privat atau "Hanya Teman")',
+            'Buka link di browser tanpa login — jika tidak bisa terbuka, video memang privat',
+            'Untuk Instagram Reels: salin link dari ikon Share → Salin Tautan',
+            'Untuk TikTok: hanya video publik yang bisa diunduh'],
+  geo:     ['Video dibatasi geografis — server tidak bisa mengaksesnya',
+            'Coba platform lain atau video dari kreator yang tidak membatasi wilayah'],
+  age:     ['Video memerlukan verifikasi usia akun',
+            'Tidak dapat diakses tanpa akun yang sudah diverifikasi umur'],
+  removed: ['Video kemungkinan sudah dihapus pemilik atau dikenai copyright',
+            'Coba buka link di browser — jika "Video Unavailable", video memang sudah hilang'],
+  url:     ['Pastikan link mengarah langsung ke video, bukan ke profil atau beranda',
+            'YouTube: gunakan youtube.com/watch?v=... atau youtu.be/...',
+            'TikTok: Share video → Copy Link (bukan salin alamat bar)',
+            'Instagram: link harus ke postingan/Reels, bukan ke profil (@username)',
+            'Facebook: link video publik (bukan video dari grup privat)'],
+  rate:    ['Server terlalu banyak permintaan ke platform ini', 'Tunggu 1–2 menit lalu coba lagi'],
+  generic: ['Pastikan URL bisa dibuka di browser terlebih dahulu',
+            'Coba update yt-dlp: pip install -U yt-dlp',
+            'Beberapa video memang tidak dapat didownload karena kebijakan platform']
+};
+
+function getCategory(msg) {
+  const m = msg.toLowerCase();
+  if (/privat|private|login|sign in|members only|who can watch/.test(m)) return 'login';
+  if (/geo|negara|country|blocked in/.test(m)) return 'geo';
+  if (/usia|age|18\+|adult/.test(m)) return 'age';
+  if (/dihapus|removed|deleted|unavailable|no longer/.test(m)) return 'removed';
+  if (/url|dikenali|unsupported/.test(m)) return 'url';
+  if (/rate limit|429|terlalu banyak/.test(m)) return 'rate';
+  return 'generic';
 }
 
-// ── DETECT PLATFORM ON INPUT ──
-document.getElementById('url-input').addEventListener('input', function(){
-  const v = this.value.trim();
-  const tag = document.getElementById('platform-tag');
-  if(!v){tag.classList.remove('show');return}
-  const p = detectPlatform(v);
-  if(p!=='unknown'){
-    document.getElementById('platform-name').textContent = P_ICON[p] || p;
-    tag.classList.add('show');
-  } else {
-    tag.classList.remove('show');
-  }
-});
+function toast(msg, type='info', ms=4200) {
+  const w = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = `toast t-${type}`;
+  el.textContent = (type==='ok'?'✅ ':type==='err'?'❌ ':'💬 ') + msg;
+  w.appendChild(el);
+  setTimeout(()=>{el.style.cssText='opacity:0;transform:translateX(38px);transition:.35s';
+    setTimeout(()=>el.remove(),370)},ms);
+}
 
-document.getElementById('url-input').addEventListener('keydown',function(e){
-  if(e.key==='Enter') fetchInfo();
-});
+function showErr(msg) {
+  document.getElementById('emsg').textContent = msg;
+  const cat  = getCategory(msg);
+  const tips = TIPS[cat] || TIPS.generic;
+  document.getElementById('etips-list').innerHTML = tips.map(t=>`<li>${t}</li>`).join('');
+  document.getElementById('ebox').classList.add('on');
+  document.getElementById('info').classList.remove('on');
+}
+function hideErr() { document.getElementById('ebox').classList.remove('on'); }
 
-function detectPlatform(url){
-  if(/youtube\.com|youtu\.be/i.test(url)) return 'youtube';
-  if(/tiktok\.com|vm\.tiktok\.com/i.test(url)) return 'tiktok';
-  if(/instagram\.com/i.test(url)) return 'instagram';
-  if(/facebook\.com|fb\.watch/i.test(url)) return 'facebook';
-  if(/twitter\.com|x\.com/i.test(url)) return 'twitter';
+function detectPlatform(u) {
+  if (/youtube\.com|youtu\.be/i.test(u))       return 'youtube';
+  if (/tiktok\.com|vm\.tiktok\.com/i.test(u))  return 'tiktok';
+  if (/instagram\.com/i.test(u))               return 'instagram';
+  if (/facebook\.com|fb\.watch/i.test(u))      return 'facebook';
+  if (/twitter\.com|x\.com/i.test(u))          return 'twitter';
   return 'unknown';
 }
 
-// ── FETCH INFO ──
-async function fetchInfo(){
-  const url = document.getElementById('url-input').value.trim();
-  if(!url){toast('Masukkan URL video terlebih dahulu','error');return;}
+document.getElementById('url-in').addEventListener('input', function() {
+  hideErr();
+  const p = detectPlatform(this.value.trim());
+  const t = document.getElementById('ptag');
+  if (p !== 'unknown') {
+    document.getElementById('pname').textContent = PL[p];
+    t.classList.add('on');
+  } else t.classList.remove('on');
+});
+document.getElementById('url-in').addEventListener('keydown', e => {
+  if (e.key === 'Enter') fetchInfo();
+});
 
-  const btn = document.getElementById('fetch-btn');
+async function fetchInfo() {
+  const url = document.getElementById('url-in').value.trim();
+  if (!url) { toast('Masukkan URL video dulu', 'err'); return; }
+
+  const btn = document.getElementById('fbtn');
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Mengambil...';
-  document.getElementById('info-section').classList.remove('show');
+  btn.innerHTML = '<span class="spin"></span> Mengambil…';
+  hideErr();
+  document.getElementById('info').classList.remove('on');
 
-  try{
-    const res = await fetch('/api/info',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({url})
-    });
+  try {
+    const res  = await fetch('/api/info', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({url})});
     const data = await res.json();
+    if (!res.ok || data.error) { showErr(data.error || 'Gagal mengambil info video'); return; }
 
-    if(!res.ok || data.error){
-      toast(data.error||'Gagal mengambil info video','error',6000);
-      return;
-    }
-
-    currentInfo = data;
-    selectedFormat = data.formats?.[0]?.format_id || 'best';
+    info    = data;
+    selFmt  = data.formats?.[0]?.format_id || 'best';
     renderInfo(data);
-    document.getElementById('info-section').classList.add('show');
-
-  }catch(e){
-    toast('Koneksi gagal. Cek internet kamu.','error');
-  }finally{
+    document.getElementById('info').classList.add('on');
+  } catch(e) {
+    showErr('Koneksi gagal. Periksa koneksi internet kamu.');
+  } finally {
     btn.disabled = false;
-    btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Cari';
+    btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Cari';
   }
 }
 
-function renderInfo(d){
-  // Thumbnail
-  const img = document.getElementById('thumb-img');
+function renderInfo(d) {
+  const img = document.getElementById('thumb');
   img.src = d.thumbnail || '';
-  img.onerror = () => { img.src=''; img.style.background='var(--bg3)'; };
+  img.onerror = () => { img.src = ''; img.style.background = 'var(--bg3)'; };
+  document.getElementById('mtitle').textContent  = d.title || 'Tanpa Judul';
+  document.getElementById('mtitle2').textContent = d.title || 'Preview';
+  document.getElementById('mdur').querySelector('span').textContent   = d.duration || 'N/A';
+  document.getElementById('mup').querySelector('span').textContent    = d.uploader || 'N/A';
+  document.getElementById('mplat').querySelector('span').textContent  = PL[d.platform] || d.platform;
 
-  // Meta
-  document.getElementById('meta-title').textContent = d.title || 'Tanpa Judul';
-  document.getElementById('meta-dur').querySelector('span').textContent = d.duration || 'N/A';
-  document.getElementById('meta-uploader').querySelector('span').textContent = d.uploader || 'N/A';
-  document.getElementById('meta-platform').querySelector('span').textContent = P_ICON[d.platform] || d.platform;
-  document.getElementById('modal-title').textContent = d.title || 'Preview';
-
-  // Formats
-  const grid = document.getElementById('format-grid');
+  const grid = document.getElementById('fgrid');
   grid.innerHTML = '';
-  (d.formats||[]).forEach((f,i)=>{
+  (d.formats || []).forEach((f, i) => {
     const b = document.createElement('button');
-    b.className = 'fmt-btn' + (i===0?' active':'');
+    b.className = 'fbtn' + (i === 0 ? ' sel' : '');
     b.dataset.fid = f.format_id;
-    const audio = f.has_audio ? '🔊' : '🔇';
-    b.textContent = `${f.label} ${audio} ${f.filesize!=='N/A'?'· '+f.filesize:''}`.trim();
-    b.onclick = ()=>{
-      document.querySelectorAll('.fmt-btn').forEach(x=>x.classList.remove('active'));
-      b.classList.add('active');
-      selectedFormat = f.format_id;
+    const au = f.has_audio ? '🔊' : '🔇';
+    b.textContent = `${f.label} ${au}${f.filesize !== 'N/A' ? ' · ' + f.filesize : ''}`.trim();
+    b.onclick = () => {
+      document.querySelectorAll('.fbtn').forEach(x => x.classList.remove('sel'));
+      b.classList.add('sel');
+      selFmt = f.format_id;
     };
     grid.appendChild(b);
   });
 }
 
-// ── DOWNLOAD ──
-async function startDownload(){
-  if(!currentInfo){toast('Cari video dulu','error');return;}
+async function startDownload() {
+  if (!info) { toast('Cari video dulu', 'err'); return; }
 
-  const btn = document.getElementById('dl-btn');
-  const progressWrap = document.getElementById('progress-wrap');
-  const progressBar = document.getElementById('progress-bar');
+  const btn  = document.getElementById('dlbtn');
+  const pw   = document.getElementById('pwrap');
+  const pb   = document.getElementById('pbar');
 
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Memproses...';
-  progressWrap.style.display='block';
-  progressBar.style.width='5%';
+  btn.innerHTML = '<span class="spin"></span> Memproses & Mengunduh…';
+  pw.style.display = 'block';
+  pb.style.width = '5%';
 
-  // Animate progress bar
   let pct = 5;
-  const pInterval = setInterval(()=>{
-    if(pct<85){pct+=Math.random()*8;progressBar.style.width=Math.min(pct,85)+'%'}
-  },400);
+  const pi = setInterval(() => {
+    if (pct < 80) { pct += Math.random() * 5.5; pb.style.width = Math.min(pct, 80) + '%'; }
+  }, 550);
 
-  try{
-    const res = await fetch('/download',{
-      method:'POST',
+  try {
+    const res = await fetch('/download', {method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({url:currentInfo.original_url, format_id:selectedFormat||'best'})
-    });
+      body:JSON.stringify({url:info.original_url, format_id:selFmt||'best'})});
 
-    if(!res.ok){
-      const err = await res.json().catch(()=>({}));
-      toast(err.error||'Download gagal','error',7000);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      showErr(err.error || 'Download gagal');
       return;
     }
 
-    clearInterval(pInterval);
-    progressBar.style.width='100%';
+    clearInterval(pi);
+    pb.style.width = '100%';
 
     const blob = await res.blob();
-    const dlName = res.headers.get('Content-Disposition')?.match(/filename="(.+)"/)?.[1] || 'video.mp4';
-    const objUrl = URL.createObjectURL(blob);
+    const name = res.headers.get('Content-Disposition')?.match(/filename="(.+)"/)?.[1] || 'video.mp4';
     const a = document.createElement('a');
-    a.href = objUrl; a.download = dlName;
-    document.body.appendChild(a); a.click();
-    document.body.removeChild(a);
-    setTimeout(()=>URL.revokeObjectURL(objUrl),30000);
+    a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(a.href), 30000);
 
-    toast('Download berhasil! 🎉','success');
-    addHistory(currentInfo);
-
-  }catch(e){
-    toast('Gagal download: '+e.message,'error',6000);
-    clearInterval(pInterval);
-  }finally{
+    toast('Download berhasil! 🎉', 'ok');
+    addHist(info);
+  } catch(e) {
+    showErr('Download gagal: ' + e.message);
+    clearInterval(pi);
+  } finally {
     btn.disabled = false;
-    btn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Download Video (MP4)';
-    setTimeout(()=>{progressWrap.style.display='none';progressBar.style.width='0%'},1500);
+    btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Download Video (MP4)';
+    setTimeout(() => { pw.style.display = 'none'; pb.style.width = '0'; }, 1400);
   }
 }
 
-// ── PREVIEW MODAL ──
-function openPreview(){
-  if(!currentInfo?.original_url) return;
-  const v = document.getElementById('preview-video');
-  // Only works if direct stream is available; otherwise show thumbnail
-  v.src = currentInfo.original_url;
-  document.getElementById('modal').classList.add('show');
+function openPreview() {
+  if (!info?.original_url) return;
+  document.getElementById('pvideo').src = info.original_url;
+  document.getElementById('modal').classList.add('on');
 }
-function closePreviewDirect(){
-  const v = document.getElementById('preview-video');
-  v.pause(); v.src='';
-  document.getElementById('modal').classList.remove('show');
+function closeModalDirect() {
+  const v = document.getElementById('pvideo');
+  v.pause(); v.src = '';
+  document.getElementById('modal').classList.remove('on');
 }
-function closePreview(e){if(e.target.id==='modal') closePreviewDirect();}
-document.addEventListener('keydown',e=>{if(e.key==='Escape') closePreviewDirect()});
+function closeModal(e) { if (e.target.id === 'modal') closeModalDirect(); }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModalDirect(); });
 
-// ── HISTORY ──
-function addHistory(info){
-  const item = {
-    title: info.title, thumbnail: info.thumbnail,
-    platform: info.platform, url: info.original_url,
-    time: new Date().toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'})
-  };
-  downloadHistory.unshift(item);
-  if(downloadHistory.length>20) downloadHistory.pop();
-  sessionStorage.setItem('vdl_history', JSON.stringify(downloadHistory));
-  renderHistory();
+function addHist(d) {
+  hist.unshift({title:d.title, thumbnail:d.thumbnail, platform:d.platform,
+    url:d.original_url, time:new Date().toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'})});
+  if (hist.length > 20) hist.pop();
+  sessionStorage.setItem('vdl_h', JSON.stringify(hist));
+  renderHist();
 }
-
-function renderHistory(){
-  const sec = document.getElementById('history-section');
-  const list = document.getElementById('history-list');
-  if(!downloadHistory.length){sec.classList.remove('show');return;}
-  sec.classList.add('show');
-  list.innerHTML = downloadHistory.map(h=>`
-    <div class="history-item">
-      <img class="h-thumb" src="${h.thumbnail||''}" alt="" onerror="this.style.background='var(--bg3)';this.src=''">
-      <div class="h-title" title="${escHtml(h.title)}">${escHtml(h.title)}</div>
-      <div class="h-platform">${P_ICON[h.platform]||h.platform}</div>
-      <div class="h-time">${h.time}</div>
-    </div>
-  `).join('');
+function renderHist() {
+  const sec = document.getElementById('hist');
+  const ul  = document.getElementById('hlist');
+  if (!hist.length) { sec.classList.remove('on'); return; }
+  sec.classList.add('on');
+  ul.innerHTML = hist.map(h => `
+    <div class="hi">
+      <img class="hthumb" src="${e(h.thumbnail)}" alt="" onerror="this.src='';this.style.background='var(--bg3)'">
+      <div class="htitle" title="${e(h.title)}">${e(h.title)}</div>
+      <div class="hplat">${PL[h.platform]||h.platform}</div>
+      <div class="htime">${h.time}</div>
+    </div>`).join('');
 }
-
-function clearHistory(){
-  downloadHistory=[];
-  sessionStorage.removeItem('vdl_history');
-  renderHistory();
-  toast('Riwayat dihapus','info',2000);
+function clearHist() {
+  hist = []; sessionStorage.removeItem('vdl_h'); renderHist();
+  toast('Riwayat dihapus', 'inf', 2000);
 }
-
-function escHtml(s){
-  return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-// Init
-renderHistory();
+const e = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+renderHist();
 </script>
 </body>
 </html>"""
