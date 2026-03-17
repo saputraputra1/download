@@ -14,7 +14,6 @@ except ImportError:
     HAS_REQUESTS = False
 
 app = Flask(__name__)
-# Vercel: filesystem is read-only except /tmp
 DOWNLOAD_DIR = Path("/tmp/downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -63,20 +62,100 @@ def get_format_selector(fmt: str) -> str:
         "mp3":   "bestaudio/best",
     }.get(fmt, "bestvideo[height<=720]+bestaudio/best")
 
-def base_ydl_opts(hook=None) -> dict:
+# ── User-Agents per platform ──────────────────────────────────
+_UA_CHROME = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+_UA_ANDROID_TT = (
+    "com.zhiliaoapp.musically/2022600030 "
+    "(Linux; U; Android 13; en_US; Pixel 7; "
+    "Build/TQ3A.230901.001; Cronet/58.0.2991.0)"
+)
+_UA_IPHONE = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.0 Mobile/15E148 Safari/604.1"
+)
+
+def build_ydl_opts(url: str = "", hook=None) -> dict:
+    """
+    Return yt-dlp options tuned per platform to bypass bot-detection.
+    Drop-in replacement for base_ydl_opts(); call sites stay the same.
+    """
+    u = url.lower()
+
+    # ── Base opts ────────────────────────────────────────────
     o = {
-        "quiet": True, "no_warnings": True, "socket_timeout": 60,
+        "quiet":              True,
+        "no_warnings":        True,
+        "socket_timeout":     60,
+        "nocheckcertificate": True,
+        "geo_bypass":         True,
+        "age_limit":          99,
+        "extractor_args":     {},
         "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
+            "User-Agent":      _UA_CHROME,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
         },
     }
+
+    # ── YouTube: android client bypasses sign-in & age-gate ──
+    if "youtube.com" in u or "youtu.be" in u:
+        o["extractor_args"] = {
+            "youtube": {
+                "player_client": ["android", "web"],
+                "player_skip":   ["webpage", "config"],
+            }
+        }
+
+    # ── TikTok: mobile API + Android UA ──────────────────────
+    elif "tiktok.com" in u:
+        o["http_headers"]["User-Agent"] = _UA_ANDROID_TT
+        o["extractor_args"] = {
+            "tiktok": {
+                "api_hostname": "api22-normal-c-useast2a.tiktokv.com",
+                "app_version":  "26.1.3",
+            }
+        }
+
+    # ── Instagram: iPhone UA + Referer ───────────────────────
+    elif "instagram.com" in u:
+        o["http_headers"] = {
+            "User-Agent":      _UA_IPHONE,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer":         "https://www.instagram.com/",
+        }
+        o["extractor_args"] = {
+            "instagram": {"include_feed_data": ["0"]}
+        }
+
+    # ── Facebook ─────────────────────────────────────────────
+    elif "facebook.com" in u or "fb.watch" in u:
+        o["http_headers"] = {
+            "User-Agent":      _UA_CHROME,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer":         "https://www.facebook.com/",
+            "sec-fetch-site":  "same-origin",
+        }
+
+    # ── Twitter / X ──────────────────────────────────────────
+    elif "twitter.com" in u or "x.com" in u:
+        o["http_headers"] = {
+            "User-Agent":      _UA_CHROME,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer":         "https://twitter.com/",
+        }
+
     if hook:
         o["progress_hooks"] = [hook]
     return o
+
+# Keep old name as alias so any future code that calls base_ydl_opts() still works
+def base_ydl_opts(hook=None) -> dict:
+    return build_ydl_opts(hook=hook)
 
 def pick_thumbnail(info: dict) -> str:
     t = info.get("thumbnail") or ""
@@ -1250,7 +1329,8 @@ def api_info():
         except Exception as e:
             return jsonify({"success":False,"error":f"UCShare: {str(e)[:180]}"})
 
-    opts = base_ydl_opts()
+    opts = build_ydl_opts(url)          # ← platform-aware, bukan base_ydl_opts()
+    opts["skip_download"] = True
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -1277,14 +1357,29 @@ def api_info():
 
     except yt_dlp.utils.DownloadError as e:
         msg = str(e).lower()
-        if "private"   in msg: err="Konten ini bersifat private."
-        elif "removed" in msg or "deleted" in msg: err="Konten telah dihapus."
-        elif "age"     in msg: err="Konten memerlukan verifikasi usia."
-        elif "unavailable" in msg: err="Konten tidak tersedia di wilayah ini."
-        else: err="Gagal memuat konten. Periksa URL-nya."
+        raw = str(e)
+        if any(k in msg for k in ["private","sign in","login","members only","who can watch"]):
+            err = "Video bersifat private atau memerlukan login."
+        elif any(k in msg for k in ["removed","deleted","no longer available","unavailable"]):
+            err = "Video telah dihapus atau tidak tersedia lagi."
+        elif any(k in msg for k in ["age","18+","age-restricted"]):
+            err = "Video memiliki batasan usia dan memerlukan akun terverifikasi."
+        elif any(k in msg for k in ["geo","not available in your country","blocked"]):
+            err = "Video dibatasi geografis, tidak bisa diakses dari server ini."
+        elif "unsupported url" in msg:
+            err = "URL tidak dikenali. Pastikan link mengarah langsung ke video."
+        elif any(k in msg for k in ["429","too many requests","rate limit"]):
+            err = "Terlalu banyak permintaan. Tunggu 1–2 menit lalu coba lagi."
+        elif "403" in msg:
+            err = "Akses ditolak platform (403). Coba beberapa saat lagi."
+        elif "404" in msg:
+            err = "Video tidak ditemukan (404). Mungkin sudah dihapus."
+        else:
+            # Tampilkan pesan asli yt-dlp (dipotong) supaya mudah debug
+            err = f"Gagal: {raw[:180]}"
         return jsonify({"success":False,"error":err})
     except Exception as e:
-        return jsonify({"success":False,"error":f"Error: {str(e)[:120]}"})
+        return jsonify({"success":False,"error":f"Error tidak terduga: {str(e)[:180]}"})
 
 
 @app.route("/api/download", methods=["POST"])
@@ -1348,7 +1443,7 @@ def api_download():
 
     out_tmpl = str(DOWNLOAD_DIR / f"{safe_sid}_%(title)s.%(ext)s")
 
-    opts = base_ydl_opts(hook)
+    opts = build_ydl_opts(url, hook)    # ← platform-aware
     opts["outtmpl"] = out_tmpl
     opts["format"]  = get_format_selector(fmt)
 
@@ -1397,13 +1492,23 @@ def api_download():
     except yt_dlp.utils.DownloadError as e:
         progress_store.pop(session_id, None)
         msg = str(e).lower()
-        if "private"   in msg: err="Konten bersifat private."
-        elif "unavailable" in msg: err="Konten tidak tersedia."
-        else: err="Download gagal. Coba lagi."
+        raw = str(e)
+        if any(k in msg for k in ["private","sign in","login","members only"]):
+            err = "Video bersifat private atau memerlukan login."
+        elif any(k in msg for k in ["removed","deleted","no longer available","unavailable"]):
+            err = "Video telah dihapus atau tidak tersedia."
+        elif any(k in msg for k in ["age","18+","age-restricted"]):
+            err = "Video memiliki batasan usia."
+        elif any(k in msg for k in ["geo","not available in your country"]):
+            err = "Video dibatasi geografis."
+        elif any(k in msg for k in ["429","too many requests","rate limit"]):
+            err = "Terlalu banyak permintaan. Tunggu 1–2 menit."
+        else:
+            err = f"Download gagal: {raw[:180]}"
         return jsonify({"error":err}), 400
     except Exception as e:
         progress_store.pop(session_id, None)
-        return jsonify({"error":f"Error: {str(e)[:120]}"}), 500
+        return jsonify({"error":f"Error tidak terduga: {str(e)[:180]}"}), 500
 
 
 @app.route("/api/progress/<session_id>")
